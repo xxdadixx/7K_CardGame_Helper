@@ -1,9 +1,12 @@
 import sys
+import os
 import cv2
 import time
 import numpy as np
 import mss
 import keyboard
+import ctypes
+from datetime import datetime
 from PyQt6.QtWidgets import (
     QApplication,
     QWidget,
@@ -16,9 +19,6 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QImage, QPixmap, QPainter, QColor
 
-# ---------------------------------------------------------
-# APPLE QSS STYLING
-# ---------------------------------------------------------
 # ---------------------------------------------------------
 # APPLE QSS STYLING
 # ---------------------------------------------------------
@@ -67,23 +67,17 @@ class RecordThread(QThread):
         super().__init__()
         self.is_recording = False
         self.frames = []
-        # Removed mss initialization from the main thread context
 
     def run(self):
         self.frames = []
 
-        # Initialize mss inside the worker thread context using a context manager
         with mss.mss() as sct:
-            # Grab the primary monitor (index 1 is usually the primary display)
             monitor = sct.monitors[1]
-
-            # Capture frames at ~10 FPS to save RAM while recording
             while self.is_recording:
                 img_np = np.array(sct.grab(monitor))
                 self.frames.append(img_np)
                 time.sleep(0.1)
 
-        # Emit the buffered frames once recording is stopped and mss cleans up
         self.finished_signal.emit(self.frames)
 
 
@@ -94,7 +88,6 @@ class HotkeyThread(QThread):
     toggle_signal = pyqtSignal()
 
     def run(self):
-        # We use a slight debounce to prevent double-firing
         while True:
             keyboard.wait("f2")
             self.toggle_signal.emit()
@@ -113,12 +106,10 @@ class VerificationWindow(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setStyleSheet(APPLE_STYLE)
 
-        # Base Layout
         main_layout = QVBoxLayout(self)
         main_layout.setContentsMargins(20, 20, 20, 20)
         main_layout.setSpacing(16)
 
-        # Header (Title + Close Button)
         header_layout = QHBoxLayout()
         title = QLabel("Solution Verification")
         title.setObjectName("TitleText")
@@ -131,7 +122,6 @@ class VerificationWindow(QWidget):
         header_layout.addStretch()
         header_layout.addWidget(btn_close)
 
-        # 3x8 Grid Layout for Cards
         self.grid_widget = QWidget()
         self.grid_layout = QGridLayout(self.grid_widget)
         self.grid_layout.setSpacing(8)
@@ -140,7 +130,7 @@ class VerificationWindow(QWidget):
         self.image_labels = []
         for i in range(24):
             lbl = QLabel()
-            lbl.setFixedSize(60, 85)  # Scaled down nicely for UI
+            lbl.setFixedSize(60, 85)
             lbl.setStyleSheet(
                 "background-color: rgba(255,255,255,0.05); border-radius: 6px;"
             )
@@ -155,7 +145,7 @@ class VerificationWindow(QWidget):
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.setBrush(QColor(28, 28, 30, 240))  # Solid translucent dark background
+        painter.setBrush(QColor(28, 28, 30, 240))
         painter.setPen(Qt.PenStyle.NoPen)
         painter.drawRoundedRect(self.rect(), 16, 16)
 
@@ -217,7 +207,6 @@ class MainWindow(QWidget):
         self.lbl_status.setObjectName("StatusReady")
         self.lbl_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
-        # Primary Action Button (Fallback for F2 Hotkey)
         self.btn_toggle = QPushButton("Start Recording (F2)")
         self.btn_toggle.setObjectName("RecordBtnReady")
         self.btn_toggle.clicked.connect(self.toggle_recording)
@@ -258,13 +247,11 @@ class MainWindow(QWidget):
         if not self.is_recording:
             self.is_recording = True
 
-            # Update Label
             self.lbl_status.setText("Recording...")
             self.lbl_status.setObjectName("StatusRecording")
             self.style().unpolish(self.lbl_status)
             self.style().polish(self.lbl_status)
 
-            # Update Button dynamically to Orange "Stop"
             self.btn_toggle.setText("Stop & Process (F2)")
             self.btn_toggle.setObjectName("RecordBtnRecording")
             self.style().unpolish(self.btn_toggle)
@@ -275,18 +262,15 @@ class MainWindow(QWidget):
         else:
             self.is_recording = False
 
-            # Update Label
             self.lbl_status.setText("Processing Buffer...")
             self.lbl_status.setObjectName("StatusRecording")
             self.style().unpolish(self.lbl_status)
             self.style().polish(self.lbl_status)
 
-            # Update Button to Processing State and lock it
             self.btn_toggle.setText("Calculating Grid...")
             self.btn_toggle.setEnabled(False)
 
             self.record_thread.is_recording = False
-            # Thread will naturally finish and emit the buffer to `process_buffer`
 
     def process_buffer(self, frames):
         if not frames:
@@ -319,7 +303,6 @@ class MainWindow(QWidget):
                 if 0.60 <= aspect_ratio <= 0.75 and 150 < w < 400 and 200 < h < 550:
                     valid_boxes.append((x, y, w, h))
 
-            # Non-Maximum Suppression (Filter overlaps)
             filtered_boxes = []
             for box in valid_boxes:
                 x1, y1, w1, h1 = box
@@ -410,7 +393,6 @@ class MainWindow(QWidget):
                 print("Mathematical Grid perfectly reconstructed from Anchor Frame.")
                 break
 
-        # 6. Smart Face-Up Extraction (Mean Brightness)
         if final_24_boxes:
             print("--- 2. Smart Face-Up Extraction (HSV Brightness) ---")
             best_card_images = []
@@ -479,16 +461,18 @@ class MainWindow(QWidget):
                         1,
                     )
 
-            import os
+            # --- DEDICATED TIMESTAMPED LOG FOLDER ---
+            debug_dir = "debug_logs"
+            os.makedirs(debug_dir, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filepath = os.path.join(debug_dir, f"debug_vision_{timestamp}.jpg")
 
-            cv2.imwrite("debug_vision.jpg", debug_img)
-            print(f"Debug image exported to: {os.path.abspath('debug_vision.jpg')}")
+            cv2.imwrite(filepath, debug_img)
+            print(f"Debug image exported to: {os.path.abspath(filepath)}")
 
-        # Polish label styles
         self.style().unpolish(self.lbl_status)
         self.style().polish(self.lbl_status)
 
-        # Completely unlock and reset the Main Action Button
         self.btn_toggle.setText("Start Recording (F2)")
         self.btn_toggle.setObjectName("RecordBtnReady")
         self.btn_toggle.setEnabled(True)
@@ -501,7 +485,6 @@ class MainWindow(QWidget):
         self.style().unpolish(self.lbl_status)
         self.style().polish(self.lbl_status)
 
-        # Reset the Main Action Button
         self.btn_toggle.setText("Start Recording (F2)")
         self.btn_toggle.setObjectName("RecordBtnReady")
         self.btn_toggle.setEnabled(True)
@@ -513,7 +496,34 @@ class MainWindow(QWidget):
         QApplication.quit()
 
 
+# ---------------------------------------------------------
+# UAC ELEVATION & MAIN EXECUTION
+# ---------------------------------------------------------
+def is_admin():
+    try:
+        return ctypes.windll.shell32.IsUserAnAdmin()
+    except:
+        return False
+
+
 if __name__ == "__main__":
+    # 1. Auto-Request Administrator Privileges
+    if not is_admin():
+        print("Requesting Administrator privileges...")
+        # Handles both running as a pure python script and as a compiled PyInstaller .exe
+        if getattr(sys, "frozen", False):
+            # Running as compiled executable
+            ctypes.windll.shell32.ShellExecuteW(
+                None, "runas", sys.executable, " ".join(sys.argv[1:]), None, 1
+            )
+        else:
+            # Running as a python script
+            ctypes.windll.shell32.ShellExecuteW(
+                None, "runas", sys.executable, " ".join(sys.argv), None, 1
+            )
+        sys.exit()
+
+    # 2. Start Application
     app = QApplication(sys.argv)
     window = MainWindow()
     window.show()
