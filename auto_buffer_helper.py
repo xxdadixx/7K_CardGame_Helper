@@ -267,9 +267,10 @@ class MainWindow(QWidget):
         success = False
         best_frame = None
         best_boxes = []
-        best_diff = float("inf")  # Track how close we got to 24
+        best_diff = float("inf")
 
         print("--- Starting Frame Analysis ---")
+        # We loop backward to find the clean, face-down coordinates
         for i, frame in enumerate(reversed(frames)):
             gray = cv2.cvtColor(frame, cv2.COLOR_BGRA2GRAY)
             blur = cv2.GaussianBlur(gray, (5, 5), 0)
@@ -287,11 +288,10 @@ class MainWindow(QWidget):
                 x, y, w, h = cv2.boundingRect(c)
                 aspect_ratio = w / float(h)
 
-                # Widened tolerances: Aspect ratio ~0.50 to 0.85
                 if 0.50 <= aspect_ratio <= 0.85 and 40 < w < 400 and 60 < h < 600:
                     valid_boxes.append((x, y, w, h))
 
-            # Non-Maximum Suppression (Filter overlaps)
+            # Non-Maximum Suppression
             filtered_boxes = []
             for box in valid_boxes:
                 x1, y1, w1, h1 = box
@@ -307,23 +307,21 @@ class MainWindow(QWidget):
                 if not is_overlap:
                     filtered_boxes.append(box)
 
+            # Debug output. Calculate the actual frame index for clarity.
+            actual_frame_idx = len(frames) - 1 - i
             print(
-                f"Frame {i}: Contours: {len(contours)} | Valid: {len(valid_boxes)} | NMS Filtered: {len(filtered_boxes)}"
+                f"Frame {actual_frame_idx}: Contours: {len(contours)} | Valid: {len(valid_boxes)} | NMS Filtered: {len(filtered_boxes)}"
             )
 
-            # Keep track of the "best" frame for our debug image
             diff = abs(len(filtered_boxes) - 24)
             if diff < best_diff:
                 best_diff = diff
                 best_frame = frame.copy()
                 best_boxes = list(filtered_boxes)
 
-            # SMART GRID EXTRACTION HEURISTIC
             if len(filtered_boxes) >= 24:
-                # 1. Sort all boxes top-to-bottom (by Y coordinate)
                 sorted_by_y = sorted(filtered_boxes, key=lambda b: b[1])
 
-                # 2. Group into rows. If Y difference is small (<50px), it's the same row.
                 rows = []
                 current_row = [sorted_by_y[0]]
                 for box in sorted_by_y[1:]:
@@ -334,58 +332,57 @@ class MainWindow(QWidget):
                         current_row = [box]
                 rows.append(current_row)
 
-                # 3. Filter out any rows that don't have at least 8 elements
                 valid_rows = [r for r in rows if len(r) >= 8]
 
-                # 4. Do we have at least 3 valid rows?
                 if len(valid_rows) >= 3:
-                    # Take exactly the first 3 rows (in case game UI triggered a 4th row at the bottom)
                     valid_rows = sorted(
                         valid_rows, key=lambda r: np.mean([b[1] for b in r])
                     )[:3]
 
                     final_24_boxes = []
                     for r in valid_rows:
-                        # Sort the row left-to-right (by X coordinate)
                         sorted_x = sorted(r, key=lambda b: b[0])
-
-                        # If the row has more than 8 boxes, drop the ones with anomalous widths
                         if len(sorted_x) > 8:
                             median_w = np.median([b[2] for b in sorted_x])
-                            # Keep the 8 boxes closest to the median width
                             sorted_x = sorted(
                                 sorted_x, key=lambda b: abs(b[2] - median_w)
                             )[:8]
-                            # Re-sort left-to-right
                             sorted_x = sorted(sorted_x, key=lambda b: b[0])
 
                         final_24_boxes.extend(sorted_x)
 
                     if len(final_24_boxes) == 24:
+                        # --- THE FIX: ANCHOR MAPPING ---
+                        # We found the coordinates at the end of the recording.
+                        # Now, we pull the visual data from the START of the recording.
+                        # We use frame index 5 (or the last available frame if the buffer is tiny).
+                        extract_idx = min(5, len(frames) - 1)
+                        face_up_frame = frames[extract_idx]
+
+                        print(
+                            f"Success! Detected coordinates on Frame {actual_frame_idx}. Extracting images from Frame {extract_idx}."
+                        )
+
                         cards = [
-                            frame[y : y + h, x : x + w]
+                            face_up_frame[y : y + h, x : x + w]
                             for (x, y, w, h) in final_24_boxes
                         ]
                         self.verification_window.display_cards(cards)
                         success = True
-                        break  # We found our golden frame!
+                        break
 
-        # STATUS UPDATES & DEBUG EXPORT
+        # Status Update & Debug Export
         if success:
-            self.lbl_status.setText("Success: Found 24 Cards!")
+            self.lbl_status.setText("Success: Found 24 Face-Up Cards!")
             self.lbl_status.setObjectName("StatusReady")
         else:
             self.lbl_status.setText("Warning: See debug_vision.jpg")
             self.lbl_status.setObjectName("StatusWarning")
 
-            # Draw rectangles on the best frame and save it
             if best_frame is not None:
                 debug_img = best_frame.copy()
                 for x, y, w, h in best_boxes:
-                    cv2.rectangle(
-                        debug_img, (x, y), (x + w, y + h), (0, 0, 255), 2
-                    )  # Red bounding box
-                    # Write the dimensions above the box for easy tuning
+                    cv2.rectangle(debug_img, (x, y), (x + w, y + h), (0, 0, 255), 2)
                     cv2.putText(
                         debug_img,
                         f"{w}x{h}",
