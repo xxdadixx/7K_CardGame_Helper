@@ -267,11 +267,9 @@ class MainWindow(QWidget):
         success = False
         best_frame = None
         best_boxes = []
-        best_diff = float("inf")
         final_24_boxes = []
 
-        print("--- 1. Strict Grid Coordinate Detection (Forward Scan) ---")
-        # Scan FORWARD to find the bright, face-up borders
+        print("--- 1. Mathematical Grid Reconstruction ---")
         for i, frame in enumerate(frames):
             gray = cv2.cvtColor(frame, cv2.COLOR_BGRA2GRAY)
             blur = cv2.GaussianBlur(gray, (5, 5), 0)
@@ -289,7 +287,6 @@ class MainWindow(QWidget):
                 x, y, w, h = cv2.boundingRect(c)
                 aspect_ratio = w / float(h)
 
-                # Loosened constraints to accommodate 239x349 and larger resolutions
                 if 0.60 <= aspect_ratio <= 0.75 and 150 < w < 400 and 200 < h < 550:
                     valid_boxes.append((x, y, w, h))
 
@@ -309,82 +306,126 @@ class MainWindow(QWidget):
                 if not is_overlap:
                     filtered_boxes.append(box)
 
-            # Track best frame for debug purposes
-            diff = abs(len(filtered_boxes) - 24)
-            if diff < best_diff:
-                best_diff = diff
+            # Keep track of the frame with the most boxes for our debug image
+            if len(filtered_boxes) > len(best_boxes):
                 best_frame = frame.copy()
                 best_boxes = list(filtered_boxes)
 
-            # SMART GRID HEURISTIC
-            if len(filtered_boxes) >= 24:
-                sorted_by_y = sorted(filtered_boxes, key=lambda b: b[1])
+            # 1. ANCHOR FRAME FOUND
+            if len(filtered_boxes) >= 14:
+                print(
+                    f"Anchor frame found at index {i} with {len(filtered_boxes)} raw boxes."
+                )
 
-                rows = []
-                current_row = [sorted_by_y[0]]
-                for box in sorted_by_y[1:]:
-                    if abs(box[1] - current_row[-1][1]) < 50:
-                        current_row.append(box)
+                # 2. Calculate Medians & Centers
+                widths = [b[2] for b in filtered_boxes]
+                heights = [b[3] for b in filtered_boxes]
+                median_w = int(np.median(widths))
+                median_h = int(np.median(heights))
+
+                cx_list = [b[0] + b[2] // 2 for b in filtered_boxes]
+                cy_list = [b[1] + b[3] // 2 for b in filtered_boxes]
+
+                # Helper Function: Cluster and Extrapolate
+                def cluster_and_extrapolate(centers, target_count, max_bound):
+                    centers = sorted(centers)
+                    clusters = []
+                    current_cluster = [centers[0]]
+
+                    # Cluster centers within a 40px tolerance
+                    for c in centers[1:]:
+                        if c - current_cluster[-1] <= 40:
+                            current_cluster.append(c)
+                        else:
+                            clusters.append(int(np.mean(current_cluster)))
+                            current_cluster = [c]
+                    clusters.append(int(np.mean(current_cluster)))
+
+                    # Calculate median gap between valid adjacent clusters
+                    if len(clusters) > 1:
+                        gaps = [
+                            clusters[idx + 1] - clusters[idx]
+                            for idx in range(len(clusters) - 1)
+                        ]
+                        median_gap = int(np.median(gaps))
                     else:
-                        rows.append(current_row)
-                        current_row = [box]
-                rows.append(current_row)
+                        median_gap = 200  # Safe fallback
 
-                valid_rows = [r for r in rows if len(r) >= 8]
+                    # Fill missing INTERNAL gaps (e.g. if column 3 was completely missed)
+                    while len(clusters) < target_count:
+                        inserted = False
+                        for idx in range(len(clusters) - 1):
+                            if clusters[idx + 1] - clusters[idx] > 1.5 * median_gap:
+                                clusters.insert(
+                                    idx + 1, int(clusters[idx] + median_gap)
+                                )
+                                inserted = True
+                                break
+                        if not inserted:
+                            break
 
-                if len(valid_rows) >= 3:
-                    valid_rows = sorted(
-                        valid_rows, key=lambda r: np.mean([b[1] for b in r])
-                    )[:3]
+                    # Fill missing EXTERNAL gaps (Leftmost or Rightmost columns)
+                    while len(clusters) < target_count:
+                        space_left = clusters[0]
+                        space_right = max_bound - clusters[-1]
 
-                    temp_24_boxes = []
-                    for r in valid_rows:
-                        sorted_x = sorted(r, key=lambda b: b[0])
-                        if len(sorted_x) > 8:
-                            median_w = np.median([b[2] for b in sorted_x])
-                            sorted_x = sorted(
-                                sorted_x, key=lambda b: abs(b[2] - median_w)
-                            )[:8]
-                            sorted_x = sorted(sorted_x, key=lambda b: b[0])
+                        # Add to whichever side has more physical screen space
+                        if space_left > space_right:
+                            clusters.insert(0, int(clusters[0] - median_gap))
+                        else:
+                            clusters.append(int(clusters[-1] + median_gap))
 
-                        temp_24_boxes.extend(sorted_x)
+                    return sorted(clusters)[:target_count]
 
-                    if len(temp_24_boxes) == 24:
-                        final_24_boxes = temp_24_boxes
-                        print(f"Master Grid perfectly identified in frame {i}.")
-                        break  # Found our master coordinates! Stop scanning.
+                # 3 & 4. Extrapolate Columns (X) and Rows (Y)
+                h_frame, w_frame = frame.shape[:2]
+                cols = cluster_and_extrapolate(cx_list, 8, w_frame)
+                rows = cluster_and_extrapolate(cy_list, 3, h_frame)
 
-        # If we successfully found the 24 master coordinates, extract the best visuals
+                # 5. Generate Master Grid
+                for cy in rows:
+                    for cx in cols:
+                        x = int(cx - median_w / 2)
+                        y = int(cy - median_h / 2)
+                        # Ensure coordinates don't technically go off-screen
+                        x = max(0, x)
+                        y = max(0, y)
+                        final_24_boxes.append((x, y, median_w, median_h))
+
+                print("Mathematical Grid perfectly reconstructed from Anchor Frame.")
+                break  # We generated the 24 mathematical boxes, stop searching!
+
+        # 6. Keep Laplacian Variance Extraction
         if final_24_boxes:
             print("--- 2. Smart Face-Up Extraction (Laplacian Variance) ---")
             best_card_images = []
 
-            # Process each of the 24 cards independently
             for idx, (x, y, w, h) in enumerate(final_24_boxes):
                 highest_var = -1
                 best_roi = None
 
-                # Scan chronologically through ALL buffered frames
                 for frame in frames:
                     roi = frame[y : y + h, x : x + w]
 
-                    # Convert to grayscale to calculate edge variance
-                    gray_roi = cv2.cvtColor(roi, cv2.COLOR_BGRA2GRAY)
+                    # Safety check in case a box was generated slightly out of bounds
+                    if roi.size == 0:
+                        continue
 
-                    # Calculate Laplacian variance (measures image detail/sharpness)
+                    gray_roi = cv2.cvtColor(roi, cv2.COLOR_BGRA2GRAY)
                     variance = cv2.Laplacian(gray_roi, cv2.CV_64F).var()
 
-                    # The frame with the highest variance is the fully revealed face-up card
                     if variance > highest_var:
                         highest_var = variance
                         best_roi = roi.copy()
+
+                if best_roi is None:
+                    best_roi = np.zeros((h, w, 4), dtype=np.uint8)  # Blank fallback
 
                 best_card_images.append(best_roi)
                 print(
                     f"Card {idx+1:02d}/24 extracted with Max Variance: {highest_var:.2f}"
                 )
 
-            # Send the perfectly extracted images to the UI
             self.verification_window.display_cards(best_card_images)
             success = True
 
@@ -393,28 +434,44 @@ class MainWindow(QWidget):
             self.lbl_status.setText("Success: Extracted 24 Cards!")
             self.lbl_status.setObjectName("StatusReady")
         else:
-            self.lbl_status.setText("Error: Could not detect 3x8 grid.")
+            self.lbl_status.setText("Error: Could not find Anchor Frame.")
             self.lbl_status.setObjectName("StatusWarning")
 
-            # Export fallback image for debugging bounding boxes
-            if best_frame is not None:
-                debug_img = best_frame.copy()
+        # Draw the visual proof
+        if best_frame is not None:
+            debug_img = best_frame.copy()
+
+            if success:
+                # If we succeeded, draw the MATHEMATICALLY generated grid in NEON GREEN
+                for x, y, w, h in final_24_boxes:
+                    cv2.rectangle(debug_img, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                    cv2.putText(
+                        debug_img,
+                        f"Math {w}x{h}",
+                        (x, y - 5),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5,
+                        (0, 255, 0),
+                        1,
+                    )
+            else:
+                # If it utterly failed, draw the RAW detected boxes in RED so you can tune the sizes
                 for x, y, w, h in best_boxes:
                     cv2.rectangle(debug_img, (x, y), (x + w, y + h), (0, 0, 255), 2)
                     cv2.putText(
                         debug_img,
-                        f"{w}x{h}",
+                        f"Raw {w}x{h}",
                         (x, y - 5),
                         cv2.FONT_HERSHEY_SIMPLEX,
                         0.5,
-                        (0, 255, 255),
+                        (0, 0, 255),
                         1,
                     )
 
-                import os
+            import os
 
-                cv2.imwrite("debug_vision.jpg", debug_img)
-                print(f"Debug image exported to: {os.path.abspath('debug_vision.jpg')}")
+            cv2.imwrite("debug_vision.jpg", debug_img)
+            print(f"Debug image exported to: {os.path.abspath('debug_vision.jpg')}")
 
         self.style().unpolish(self.lbl_status)
         self.style().polish(self.lbl_status)
