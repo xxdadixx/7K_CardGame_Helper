@@ -19,7 +19,7 @@ A sleek, AI-powered computer vision utility designed to effortlessly solve the 2
 You **do not** need to install Python or know how to code to use this helper! 
 
 1. Go to the [Releases](../../releases) tab on the right side of this GitHub page.
-2. Download the latest `7K_AI_Tracker.exe` file.
+2. Download the latest `auto_buffer_helper.exe` file.
 3. Run the `.exe`. *(Note: Windows will ask for Administrator permissions. This is required so the tool can hear your F2 hotkey while the game is focused).*
 4. Once the sleek UI appears, open your game and start the card matching mini-game.
 5. As soon as the cards start flipping face-up, press **`F2`** to start recording. 
