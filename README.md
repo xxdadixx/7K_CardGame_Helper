@@ -1,5 +1,8 @@
 # 🃏 7K Rebirth Card Match Helper
 
+<img width="568" height="363" alt="Screenshot 2026-02-21 220810" src="https://github.com/user-attachments/assets/4777d861-0775-405e-9530-cda865a1388c" />
+
+
 A sleek, AI-powered computer vision utility designed to effortlessly solve the 24-card (3x8) matching mini-game in 7K Rebirth. Built entirely in Python, this tool acts as a highly intelligent screen-reader that mathematically reconstructs the game grid and perfectly captures the face-up state of every card.
 
 ## ✨ Core Features
