@@ -270,9 +270,9 @@ class MainWindow(QWidget):
         best_diff = float("inf")
         final_24_boxes = []
 
-        print("--- 1. Strict Grid Coordinate Detection ---")
-        # Scan backward to find the cleanest static coordinates
-        for i, frame in enumerate(reversed(frames)):
+        print("--- 1. Strict Grid Coordinate Detection (Forward Scan) ---")
+        # Scan FORWARD to find the bright, face-up borders
+        for i, frame in enumerate(frames):
             gray = cv2.cvtColor(frame, cv2.COLOR_BGRA2GRAY)
             blur = cv2.GaussianBlur(gray, (5, 5), 0)
             edges = cv2.Canny(blur, 30, 150)
@@ -289,8 +289,8 @@ class MainWindow(QWidget):
                 x, y, w, h = cv2.boundingRect(c)
                 aspect_ratio = w / float(h)
 
-                # Strict constraints based on target 174x254 (AR ~ 0.685)
-                if 0.60 <= aspect_ratio <= 0.75 and 100 < w < 250 and 150 < h < 350:
+                # Loosened constraints to accommodate 239x349 and larger resolutions
+                if 0.60 <= aspect_ratio <= 0.75 and 150 < w < 400 and 200 < h < 550:
                     valid_boxes.append((x, y, w, h))
 
             # Non-Maximum Suppression (Filter overlaps)
@@ -351,9 +351,7 @@ class MainWindow(QWidget):
 
                     if len(temp_24_boxes) == 24:
                         final_24_boxes = temp_24_boxes
-                        print(
-                            f"Master Grid perfectly identified in frame {len(frames) - 1 - i}."
-                        )
+                        print(f"Master Grid perfectly identified in frame {i}.")
                         break  # Found our master coordinates! Stop scanning.
 
         # If we successfully found the 24 master coordinates, extract the best visuals
