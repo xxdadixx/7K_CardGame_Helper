@@ -268,9 +268,10 @@ class MainWindow(QWidget):
         best_frame = None
         best_boxes = []
         best_diff = float("inf")
+        final_24_boxes = []
 
-        print("--- Starting Frame Analysis ---")
-        # We loop backward to find the clean, face-down coordinates
+        print("--- 1. Strict Grid Coordinate Detection ---")
+        # Scan backward to find the cleanest static coordinates
         for i, frame in enumerate(reversed(frames)):
             gray = cv2.cvtColor(frame, cv2.COLOR_BGRA2GRAY)
             blur = cv2.GaussianBlur(gray, (5, 5), 0)
@@ -288,10 +289,11 @@ class MainWindow(QWidget):
                 x, y, w, h = cv2.boundingRect(c)
                 aspect_ratio = w / float(h)
 
-                if 0.50 <= aspect_ratio <= 0.85 and 40 < w < 400 and 60 < h < 600:
+                # Strict constraints based on target 174x254 (AR ~ 0.685)
+                if 0.60 <= aspect_ratio <= 0.75 and 100 < w < 250 and 150 < h < 350:
                     valid_boxes.append((x, y, w, h))
 
-            # Non-Maximum Suppression
+            # Non-Maximum Suppression (Filter overlaps)
             filtered_boxes = []
             for box in valid_boxes:
                 x1, y1, w1, h1 = box
@@ -307,18 +309,14 @@ class MainWindow(QWidget):
                 if not is_overlap:
                     filtered_boxes.append(box)
 
-            # Debug output. Calculate the actual frame index for clarity.
-            actual_frame_idx = len(frames) - 1 - i
-            print(
-                f"Frame {actual_frame_idx}: Contours: {len(contours)} | Valid: {len(valid_boxes)} | NMS Filtered: {len(filtered_boxes)}"
-            )
-
+            # Track best frame for debug purposes
             diff = abs(len(filtered_boxes) - 24)
             if diff < best_diff:
                 best_diff = diff
                 best_frame = frame.copy()
                 best_boxes = list(filtered_boxes)
 
+            # SMART GRID HEURISTIC
             if len(filtered_boxes) >= 24:
                 sorted_by_y = sorted(filtered_boxes, key=lambda b: b[1])
 
@@ -339,7 +337,7 @@ class MainWindow(QWidget):
                         valid_rows, key=lambda r: np.mean([b[1] for b in r])
                     )[:3]
 
-                    final_24_boxes = []
+                    temp_24_boxes = []
                     for r in valid_rows:
                         sorted_x = sorted(r, key=lambda b: b[0])
                         if len(sorted_x) > 8:
@@ -349,36 +347,58 @@ class MainWindow(QWidget):
                             )[:8]
                             sorted_x = sorted(sorted_x, key=lambda b: b[0])
 
-                        final_24_boxes.extend(sorted_x)
+                        temp_24_boxes.extend(sorted_x)
 
-                    if len(final_24_boxes) == 24:
-                        # --- THE FIX: ANCHOR MAPPING ---
-                        # We found the coordinates at the end of the recording.
-                        # Now, we pull the visual data from the START of the recording.
-                        # We use frame index 5 (or the last available frame if the buffer is tiny).
-                        extract_idx = min(5, len(frames) - 1)
-                        face_up_frame = frames[extract_idx]
-
+                    if len(temp_24_boxes) == 24:
+                        final_24_boxes = temp_24_boxes
                         print(
-                            f"Success! Detected coordinates on Frame {actual_frame_idx}. Extracting images from Frame {extract_idx}."
+                            f"Master Grid perfectly identified in frame {len(frames) - 1 - i}."
                         )
+                        break  # Found our master coordinates! Stop scanning.
 
-                        cards = [
-                            face_up_frame[y : y + h, x : x + w]
-                            for (x, y, w, h) in final_24_boxes
-                        ]
-                        self.verification_window.display_cards(cards)
-                        success = True
-                        break
+        # If we successfully found the 24 master coordinates, extract the best visuals
+        if final_24_boxes:
+            print("--- 2. Smart Face-Up Extraction (Laplacian Variance) ---")
+            best_card_images = []
+
+            # Process each of the 24 cards independently
+            for idx, (x, y, w, h) in enumerate(final_24_boxes):
+                highest_var = -1
+                best_roi = None
+
+                # Scan chronologically through ALL buffered frames
+                for frame in frames:
+                    roi = frame[y : y + h, x : x + w]
+
+                    # Convert to grayscale to calculate edge variance
+                    gray_roi = cv2.cvtColor(roi, cv2.COLOR_BGRA2GRAY)
+
+                    # Calculate Laplacian variance (measures image detail/sharpness)
+                    variance = cv2.Laplacian(gray_roi, cv2.CV_64F).var()
+
+                    # The frame with the highest variance is the fully revealed face-up card
+                    if variance > highest_var:
+                        highest_var = variance
+                        best_roi = roi.copy()
+
+                best_card_images.append(best_roi)
+                print(
+                    f"Card {idx+1:02d}/24 extracted with Max Variance: {highest_var:.2f}"
+                )
+
+            # Send the perfectly extracted images to the UI
+            self.verification_window.display_cards(best_card_images)
+            success = True
 
         # Status Update & Debug Export
         if success:
-            self.lbl_status.setText("Success: Found 24 Face-Up Cards!")
+            self.lbl_status.setText("Success: Extracted 24 Cards!")
             self.lbl_status.setObjectName("StatusReady")
         else:
-            self.lbl_status.setText("Warning: See debug_vision.jpg")
+            self.lbl_status.setText("Error: Could not detect 3x8 grid.")
             self.lbl_status.setObjectName("StatusWarning")
 
+            # Export fallback image for debugging bounding boxes
             if best_frame is not None:
                 debug_img = best_frame.copy()
                 for x, y, w, h in best_boxes:
