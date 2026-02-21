@@ -395,13 +395,13 @@ class MainWindow(QWidget):
                 print("Mathematical Grid perfectly reconstructed from Anchor Frame.")
                 break  # We generated the 24 mathematical boxes, stop searching!
 
-        # 6. Keep Laplacian Variance Extraction
+        # 6. Smart Face-Up Extraction (Mean Brightness)
         if final_24_boxes:
-            print("--- 2. Smart Face-Up Extraction (Laplacian Variance) ---")
+            print("--- 2. Smart Face-Up Extraction (HSV Brightness) ---")
             best_card_images = []
 
             for idx, (x, y, w, h) in enumerate(final_24_boxes):
-                highest_var = -1
+                highest_brightness = -1
                 best_roi = None
 
                 for frame in frames:
@@ -411,11 +411,16 @@ class MainWindow(QWidget):
                     if roi.size == 0:
                         continue
 
-                    gray_roi = cv2.cvtColor(roi, cv2.COLOR_BGRA2GRAY)
-                    variance = cv2.Laplacian(gray_roi, cv2.CV_64F).var()
+                    # Convert BGRA -> BGR -> HSV
+                    bgr_roi = cv2.cvtColor(roi, cv2.COLOR_BGRA2BGR)
+                    hsv_roi = cv2.cvtColor(bgr_roi, cv2.COLOR_BGR2HSV)
 
-                    if variance > highest_var:
-                        highest_var = variance
+                    # Extract the 'Value' (Brightness) channel and find its mean
+                    # The Value channel perfectly isolates light intensity from 0 (black) to 255 (bright)
+                    brightness = hsv_roi[:, :, 2].mean()
+
+                    if brightness > highest_brightness:
+                        highest_brightness = brightness
                         best_roi = roi.copy()
 
                 if best_roi is None:
@@ -423,7 +428,7 @@ class MainWindow(QWidget):
 
                 best_card_images.append(best_roi)
                 print(
-                    f"Card {idx+1:02d}/24 extracted with Max Variance: {highest_var:.2f}"
+                    f"Card {idx+1:02d}/24 extracted with Max Brightness: {highest_brightness:.2f}"
                 )
 
             self.verification_window.display_cards(best_card_images)
