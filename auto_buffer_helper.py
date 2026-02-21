@@ -47,17 +47,23 @@ class RecordThread(QThread):
         super().__init__()
         self.is_recording = False
         self.frames = []
-        self.sct = mss.mss()
-        self.monitor = self.sct.monitors[1] # Primary monitor
+        # Removed mss initialization from the main thread context
 
     def run(self):
         self.frames = []
-        # Capture frames at ~10 FPS to save RAM while recording
-        while self.is_recording:
-            img_np = np.array(self.sct.grab(self.monitor))
-            self.frames.append(img_np)
-            time.sleep(0.1) 
+        
+        # Initialize mss inside the worker thread context using a context manager
+        with mss.mss() as sct:
+            # Grab the primary monitor (index 1 is usually the primary display)
+            monitor = sct.monitors[1] 
             
+            # Capture frames at ~10 FPS to save RAM while recording
+            while self.is_recording:
+                img_np = np.array(sct.grab(monitor))
+                self.frames.append(img_np)
+                time.sleep(0.1) 
+                
+        # Emit the buffered frames once recording is stopped and mss cleans up
         self.finished_signal.emit(self.frames)
 
 # ---------------------------------------------------------
