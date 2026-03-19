@@ -56,6 +56,7 @@ QLabel#StatusRecording { font-size: 14px; color: #FF9F0A; font-weight: bold; }
 QLabel#StatusWarning { font-size: 14px; color: #FF3B30; font-weight: bold; }
 """
 
+
 # ---------------------------------------------------------
 # FRAME BUFFER RECORDING THREAD
 # ---------------------------------------------------------
@@ -74,7 +75,7 @@ class RecordThread(QThread):
         while elapsed < self.animation_delay and self.is_recording:
             time.sleep(0.1)
             elapsed += 0.1
-            
+
         with mss.mss() as sct:
             monitor = sct.monitors[1]
             while self.is_recording:
@@ -412,9 +413,9 @@ class MainWindow(QWidget):
                 print("Mathematical Grid perfectly reconstructed from Anchor Frame.")
                 break  # We generated the 24 mathematical boxes, stop searching!
 
-        # 6. Smart Face-Up Extraction (Edge Complexity)
+        # 🌟 6. Smart Face-Up Extraction (Edge Complexity & Smart Filtering)
         if final_24_boxes:
-            print("--- 2. Smart Face-Up Extraction (Edge Complexity) ---")
+            print("--- 2. Smart Face-Up Extraction (Filtering Text Animations) ---")
             best_card_images = []
 
             for idx, (x, y, w, h) in enumerate(final_24_boxes):
@@ -427,22 +428,57 @@ class MainWindow(QWidget):
                     # Safety check in case a box was generated slightly out of bounds
                     if roi.size == 0:
                         continue
-                        
+
+                    # ==========================================================
+                    # FILTER 1: Yellow Color Rejection (Ignores "START" Text)
+                    # ==========================================================
+                    bgr_roi = cv2.cvtColor(roi, cv2.COLOR_BGRA2BGR)
+                    hsv_roi = cv2.cvtColor(bgr_roi, cv2.COLOR_BGR2HSV)
+
+                    # Define HSV bounds for highly saturated, bright yellow/gold
+                    lower_yellow = np.array([10, 100, 120])
+                    upper_yellow = np.array([40, 255, 255])
+
+                    # Create a mask for yellow pixels
+                    yellow_mask = cv2.inRange(hsv_roi, lower_yellow, upper_yellow)
+
+                    # Calculate ratio of bright yellow pixels in this specific card slot
+                    yellow_ratio = cv2.countNonZero(yellow_mask) / (w * h)
+
+                    # If > 25% of the card is glowing yellow, it's the giant text. Skip this frame!
+                    if yellow_ratio > 0.25:
+                        continue
+
+                    # ==========================================================
+                    # EDGE COMPLEXITY CALCULATION
+                    # ==========================================================
                     gray_roi = cv2.cvtColor(roi, cv2.COLOR_BGRA2GRAY)
                     blur_roi = cv2.GaussianBlur(gray_roi, (5, 5), 0)
-                    
-                    # Use Canny to map the internal details
                     canny_roi = cv2.Canny(blur_roi, 30, 150)
-                    
-                    # Calculate total edge complexity
+
                     complexity = canny_roi.sum()
 
+                    # ==========================================================
+                    # FILTER 2: Complexity Upper Bound (Safety Net)
+                    # ==========================================================
+                    # The logs showed START text generating 1,400,000+ complexity.
+                    # Normal anime character art usually stays well below 1,200,000.
+                    if complexity > 1200000:
+                        continue
+
+                    # If it passed both filters, see if it's the best face-up frame so far
                     if complexity > highest_complexity:
                         highest_complexity = complexity
                         best_roi = roi.copy()
 
+                # Fallback: If ALL frames were rejected (very rare), grab the last recorded frame
+                # (which is guaranteed to be a settled, face-down card rather than a black box)
                 if best_roi is None:
-                    best_roi = np.zeros((h, w, 4), dtype=np.uint8)  # Blank fallback
+                    best_roi = (
+                        frames[-1][y : y + h, x : x + w].copy()
+                        if frames
+                        else np.zeros((h, w, 4), dtype=np.uint8)
+                    )
 
                 best_card_images.append(best_roi)
                 print(
@@ -493,12 +529,12 @@ class MainWindow(QWidget):
 
             import os
             from datetime import datetime
-            
+
             debug_dir = "debug_logs"
             os.makedirs(debug_dir, exist_ok=True)
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             filepath = os.path.join(debug_dir, f"debug_vision_{timestamp}.jpg")
-            
+
             cv2.imwrite(filepath, debug_img)
             print(f"Debug image exported to: {os.path.abspath(filepath)}")
 
@@ -510,22 +546,6 @@ class MainWindow(QWidget):
         self.btn_toggle.setEnabled(True)
         self.style().unpolish(self.btn_toggle)
         self.style().polish(self.btn_toggle)
-
-    def reset_status(self):
-        self.lbl_status.setText("Ready")
-        self.lbl_status.setObjectName("StatusReady")
-        self.style().unpolish(self.lbl_status)
-        self.style().polish(self.lbl_status)
-
-        self.btn_toggle.setText("Start Recording (F2)")
-        self.btn_toggle.setObjectName("RecordBtnReady")
-        self.btn_toggle.setEnabled(True)
-        self.style().unpolish(self.btn_toggle)
-        self.style().polish(self.btn_toggle)
-
-    def close_app(self):
-        self.record_thread.is_recording = False
-        QApplication.quit()
 
 
 # ---------------------------------------------------------
