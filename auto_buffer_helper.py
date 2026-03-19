@@ -430,70 +430,78 @@ class MainWindow(QWidget):
                 print("Mathematical Grid perfectly reconstructed from Anchor Frame.")
                 break  # We generated the 24 mathematical boxes, stop searching!
 
-        # 🌟 6. Smart Face-Up Extraction (Edge Complexity & Smart Filtering)
-        if final_24_boxes:
-            print("--- 2. Smart Face-Up Extraction (Filtering Text Animations) ---")
+        # 🌟 NEW: 1.5 MACRO / GLOBAL FRAME FILTERING 🌟
+        clean_frames = []
+        if frames:
+            print("--- 1.5 Global Frame Filtering (Removing Text Animations) ---")
+            h_full, w_full = frames[0].shape[:2]
+            
+            # Define a massive center region (middle 50% of the screen)
+            cx1, cx2 = int(w_full * 0.25), int(w_full * 0.75)
+            cy1, cy2 = int(h_full * 0.25), int(h_full * 0.75)
+            center_area = (cx2 - cx1) * (cy2 - cy1)
+            
+            # HSV bounds for the golden/yellow "Ready" and "START" texts
+            lower_yellow = np.array([10, 100, 120])
+            upper_yellow = np.array([40, 255, 255])
+            
+            for f_idx, frame in enumerate(frames):
+                center_roi = frame[cy1:cy2, cx1:cx2]
+                
+                # Convert to HSV
+                bgr_roi = cv2.cvtColor(center_roi, cv2.COLOR_BGRA2BGR)
+                hsv_roi = cv2.cvtColor(bgr_roi, cv2.COLOR_BGR2HSV)
+                
+                # Mask and count yellow pixels in the center of the screen
+                yellow_mask = cv2.inRange(hsv_roi, lower_yellow, upper_yellow)
+                yellow_ratio = cv2.countNonZero(yellow_mask) / center_area
+                
+                # If the center of the screen has a heavy concentration of yellow (>3%), 
+                # it's the giant text animation. Discard the WHOLE frame.
+                if yellow_ratio < 0.03:
+                    clean_frames.append(frame)
+                else:
+                    print(f"Discarding Frame {f_idx}: Yellow Ratio in center is {yellow_ratio:.2%}")
+            
+            print(f"Filtered out {len(frames) - len(clean_frames)} corrupted frames. {len(clean_frames)} clean frames remaining.")
+            
+            # Fallback: Just in case a super short recording filters everything
+            if not clean_frames:
+                print("Warning: All frames were filtered. Reverting to the last recorded frame.")
+                clean_frames = [frames[-1]]
+
+        # 6. Smart Face-Up Extraction (Edge Complexity on CLEAN FRAMES)
+        if final_24_boxes and clean_frames:
+            print("--- 2. Smart Face-Up Extraction (Clean Edge Complexity) ---")
             best_card_images = []
 
             for idx, (x, y, w, h) in enumerate(final_24_boxes):
                 highest_complexity = -1
                 best_roi = None
 
-                for frame in frames:
+                # 🌟 IMPORTANT: We now ONLY iterate through clean_frames!
+                for frame in clean_frames:
                     roi = frame[y : y + h, x : x + w]
 
                     # Safety check in case a box was generated slightly out of bounds
                     if roi.size == 0:
                         continue
 
-                    # ==========================================================
-                    # FILTER 1: Yellow Color Rejection (Ignores "START" Text)
-                    # ==========================================================
-                    bgr_roi = cv2.cvtColor(roi, cv2.COLOR_BGRA2BGR)
-                    hsv_roi = cv2.cvtColor(bgr_roi, cv2.COLOR_BGR2HSV)
-
-                    # Define HSV bounds for highly saturated, bright yellow/gold
-                    lower_yellow = np.array([10, 100, 120])
-                    upper_yellow = np.array([40, 255, 255])
-
-                    # Create a mask for yellow pixels
-                    yellow_mask = cv2.inRange(hsv_roi, lower_yellow, upper_yellow)
-
-                    # Calculate ratio of bright yellow pixels in this specific card slot
-                    yellow_ratio = cv2.countNonZero(yellow_mask) / (w * h)
-
-                    # If > 25% of the card is glowing yellow, it's the giant text. Skip this frame!
-                    if yellow_ratio > 0.25:
-                        continue
-
-                    # ==========================================================
-                    # EDGE COMPLEXITY CALCULATION
-                    # ==========================================================
+                    # Calculate total edge complexity using Canny
                     gray_roi = cv2.cvtColor(roi, cv2.COLOR_BGRA2GRAY)
                     blur_roi = cv2.GaussianBlur(gray_roi, (5, 5), 0)
                     canny_roi = cv2.Canny(blur_roi, 30, 150)
 
                     complexity = canny_roi.sum()
 
-                    # ==========================================================
-                    # FILTER 2: Complexity Upper Bound (Safety Net)
-                    # ==========================================================
-                    # The logs showed START text generating 1,400,000+ complexity.
-                    # Normal anime character art usually stays well below 1,200,000.
-                    if complexity > 1200000:
-                        continue
-
-                    # If it passed both filters, see if it's the best face-up frame so far
                     if complexity > highest_complexity:
                         highest_complexity = complexity
                         best_roi = roi.copy()
 
-                # Fallback: If ALL frames were rejected (very rare), grab the last recorded frame
-                # (which is guaranteed to be a settled, face-down card rather than a black box)
                 if best_roi is None:
                     best_roi = (
-                        frames[-1][y : y + h, x : x + w].copy()
-                        if frames
+                        clean_frames[-1][y : y + h, x : x + w].copy()
+                        if clean_frames
                         else np.zeros((h, w, 4), dtype=np.uint8)
                     )
 
