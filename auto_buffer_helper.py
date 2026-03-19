@@ -303,6 +303,7 @@ class MainWindow(QWidget):
                 if 0.60 <= aspect_ratio <= 0.75 and 150 < w < 400 and 200 < h < 550:
                     valid_boxes.append((x, y, w, h))
 
+            # Non-Maximum Suppression (Filter overlaps)
             filtered_boxes = []
             for box in valid_boxes:
                 x1, y1, w1, h1 = box
@@ -318,14 +319,18 @@ class MainWindow(QWidget):
                 if not is_overlap:
                     filtered_boxes.append(box)
 
+            # Keep track of the frame with the most boxes for our debug image
             if len(filtered_boxes) > len(best_boxes):
                 best_frame = frame.copy()
                 best_boxes = list(filtered_boxes)
 
+            # 1. ANCHOR FRAME FOUND
             if len(filtered_boxes) >= 14:
                 print(
                     f"Anchor frame found at index {i} with {len(filtered_boxes)} raw boxes."
                 )
+
+                # 2. Calculate Medians & Centers
                 widths = [b[2] for b in filtered_boxes]
                 heights = [b[3] for b in filtered_boxes]
                 median_w = int(np.median(widths))
@@ -334,11 +339,13 @@ class MainWindow(QWidget):
                 cx_list = [b[0] + b[2] // 2 for b in filtered_boxes]
                 cy_list = [b[1] + b[3] // 2 for b in filtered_boxes]
 
+                # Helper Function: Cluster and Extrapolate
                 def cluster_and_extrapolate(centers, target_count, max_bound):
                     centers = sorted(centers)
                     clusters = []
                     current_cluster = [centers[0]]
 
+                    # Cluster centers within a 40px tolerance
                     for c in centers[1:]:
                         if c - current_cluster[-1] <= 40:
                             current_cluster.append(c)
@@ -347,6 +354,7 @@ class MainWindow(QWidget):
                             current_cluster = [c]
                     clusters.append(int(np.mean(current_cluster)))
 
+                    # Calculate median gap between valid adjacent clusters
                     if len(clusters) > 1:
                         gaps = [
                             clusters[idx + 1] - clusters[idx]
@@ -354,8 +362,9 @@ class MainWindow(QWidget):
                         ]
                         median_gap = int(np.median(gaps))
                     else:
-                        median_gap = 200
+                        median_gap = 200  # Safe fallback
 
+                    # Fill missing INTERNAL gaps (e.g. if column 3 was completely missed)
                     while len(clusters) < target_count:
                         inserted = False
                         for idx in range(len(clusters) - 1):
@@ -368,9 +377,12 @@ class MainWindow(QWidget):
                         if not inserted:
                             break
 
+                    # Fill missing EXTERNAL gaps (Leftmost or Rightmost columns)
                     while len(clusters) < target_count:
                         space_left = clusters[0]
                         space_right = max_bound - clusters[-1]
+
+                        # Add to whichever side has more physical screen space
                         if space_left > space_right:
                             clusters.insert(0, int(clusters[0] - median_gap))
                         else:
@@ -378,65 +390,80 @@ class MainWindow(QWidget):
 
                     return sorted(clusters)[:target_count]
 
+                # 3 & 4. Extrapolate Columns (X) and Rows (Y)
                 h_frame, w_frame = frame.shape[:2]
                 cols = cluster_and_extrapolate(cx_list, 8, w_frame)
                 rows = cluster_and_extrapolate(cy_list, 3, h_frame)
 
+                # 5. Generate Master Grid
                 for cy in rows:
                     for cx in cols:
                         x = int(cx - median_w / 2)
                         y = int(cy - median_h / 2)
+                        # Ensure coordinates don't technically go off-screen
                         x = max(0, x)
                         y = max(0, y)
                         final_24_boxes.append((x, y, median_w, median_h))
 
                 print("Mathematical Grid perfectly reconstructed from Anchor Frame.")
-                break
+                break  # We generated the 24 mathematical boxes, stop searching!
 
+        # 🌟 6. Smart Face-Up Extraction (Edge Complexity)
         if final_24_boxes:
-            print("--- 2. Smart Face-Up Extraction (HSV Brightness) ---")
+            print("--- 2. Smart Face-Up Extraction (Edge Complexity) ---")
             best_card_images = []
 
             for idx, (x, y, w, h) in enumerate(final_24_boxes):
-                highest_brightness = -1
+                highest_complexity = -1
                 best_roi = None
 
                 for frame in frames:
                     roi = frame[y : y + h, x : x + w]
 
+                    # Safety check in case a box was generated slightly out of bounds
                     if roi.size == 0:
                         continue
+                        
+                    # 🌟 เทคนิคใหม่: การหา Edge Complexity
+                    gray_roi = cv2.cvtColor(roi, cv2.COLOR_BGRA2GRAY)
+                    blur_roi = cv2.GaussianBlur(gray_roi, (5, 5), 0)
+                    
+                    # ใช้ Canny อีกครั้งเพื่อหาขอบ "ภายใน" การ์ด
+                    canny_roi = cv2.Canny(blur_roi, 30, 150)
+                    
+                    # คำนวณความซับซ้อนจากจำนวน Pixel ของขอบ
+                    # การ์ดที่มีรูปวาดจะมี Edge Pixel เยอะกว่าตัวอักษรเรียบๆ มากครับ
+                    complexity = canny_roi.sum()
 
-                    bgr_roi = cv2.cvtColor(roi, cv2.COLOR_BGRA2BGR)
-                    hsv_roi = cv2.cvtColor(bgr_roi, cv2.COLOR_BGR2HSV)
-                    brightness = hsv_roi[:, :, 2].mean()
-
-                    if brightness > highest_brightness:
-                        highest_brightness = brightness
+                    if complexity > highest_complexity:
+                        highest_complexity = complexity
                         best_roi = roi.copy()
 
                 if best_roi is None:
-                    best_roi = np.zeros((h, w, 4), dtype=np.uint8)
+                    best_roi = np.zeros((h, w, 4), dtype=np.uint8)  # Blank fallback
 
                 best_card_images.append(best_roi)
                 print(
-                    f"Card {idx+1:02d}/24 extracted with Max Brightness: {highest_brightness:.2f}"
+                    f"Card {idx+1:02d}/24 extracted with Max Complexity: {highest_complexity:.2f}"
                 )
 
             self.verification_window.display_cards(best_card_images)
             success = True
 
-        # --- FINAL STATUS & UI RESET ---
+        # Status Update & Debug Export
         if success:
             self.lbl_status.setText("Success: Extracted 24 Cards!")
             self.lbl_status.setObjectName("StatusReady")
         else:
-            self.lbl_status.setText("Error: Could not find Anchor.")
+            self.lbl_status.setText("Error: Could not find Anchor Frame.")
             self.lbl_status.setObjectName("StatusWarning")
 
+        # Draw the visual proof
         if best_frame is not None:
             debug_img = best_frame.copy()
+
             if success:
+                # If we succeeded, draw the MATHEMATICALLY generated grid in NEON GREEN
                 for x, y, w, h in final_24_boxes:
                     cv2.rectangle(debug_img, (x, y), (x + w, y + h), (0, 255, 0), 2)
                     cv2.putText(
@@ -449,6 +476,7 @@ class MainWindow(QWidget):
                         1,
                     )
             else:
+                # If it utterly failed, draw the RAW detected boxes in RED so you can tune the sizes
                 for x, y, w, h in best_boxes:
                     cv2.rectangle(debug_img, (x, y), (x + w, y + h), (0, 0, 255), 2)
                     cv2.putText(
@@ -461,12 +489,14 @@ class MainWindow(QWidget):
                         1,
                     )
 
-            # --- DEDICATED TIMESTAMPED LOG FOLDER ---
+            import os
+            from datetime import datetime
+            
             debug_dir = "debug_logs"
             os.makedirs(debug_dir, exist_ok=True)
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             filepath = os.path.join(debug_dir, f"debug_vision_{timestamp}.jpg")
-
+            
             cv2.imwrite(filepath, debug_img)
             print(f"Debug image exported to: {os.path.abspath(filepath)}")
 
