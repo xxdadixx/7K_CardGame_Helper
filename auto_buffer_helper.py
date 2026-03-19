@@ -56,7 +56,6 @@ QLabel#StatusRecording { font-size: 14px; color: #FF9F0A; font-weight: bold; }
 QLabel#StatusWarning { font-size: 14px; color: #FF3B30; font-weight: bold; }
 """
 
-
 # ---------------------------------------------------------
 # FRAME BUFFER RECORDING THREAD
 # ---------------------------------------------------------
@@ -67,10 +66,15 @@ class RecordThread(QThread):
         super().__init__()
         self.is_recording = False
         self.frames = []
+        self.animation_delay = 1.8
 
     def run(self):
         self.frames = []
-
+        elapsed = 0.0
+        while elapsed < self.animation_delay and self.is_recording:
+            time.sleep(0.1)
+            elapsed += 0.1
+            
         with mss.mss() as sct:
             monitor = sct.monitors[1]
             while self.is_recording:
@@ -408,7 +412,7 @@ class MainWindow(QWidget):
                 print("Mathematical Grid perfectly reconstructed from Anchor Frame.")
                 break  # We generated the 24 mathematical boxes, stop searching!
 
-        # 🌟 6. Smart Face-Up Extraction (Edge Complexity)
+        # 6. Smart Face-Up Extraction (Edge Complexity)
         if final_24_boxes:
             print("--- 2. Smart Face-Up Extraction (Edge Complexity) ---")
             best_card_images = []
@@ -424,15 +428,13 @@ class MainWindow(QWidget):
                     if roi.size == 0:
                         continue
                         
-                    # 🌟 เทคนิคใหม่: การหา Edge Complexity
                     gray_roi = cv2.cvtColor(roi, cv2.COLOR_BGRA2GRAY)
                     blur_roi = cv2.GaussianBlur(gray_roi, (5, 5), 0)
                     
-                    # ใช้ Canny อีกครั้งเพื่อหาขอบ "ภายใน" การ์ด
+                    # Use Canny to map the internal details
                     canny_roi = cv2.Canny(blur_roi, 30, 150)
                     
-                    # คำนวณความซับซ้อนจากจำนวน Pixel ของขอบ
-                    # การ์ดที่มีรูปวาดจะมี Edge Pixel เยอะกว่าตัวอักษรเรียบๆ มากครับ
+                    # Calculate total edge complexity
                     complexity = canny_roi.sum()
 
                     if complexity > highest_complexity:
