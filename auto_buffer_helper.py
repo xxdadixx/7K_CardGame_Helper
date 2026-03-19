@@ -1,5 +1,24 @@
 import sys
 import os
+import traceback
+from datetime import datetime
+
+# ==============================================================================
+# GLOBAL CRASH LOGGER (Must be at the very top to catch early import errors)
+# ==============================================================================
+def global_exception_handler(exc_type, exc_value, exc_traceback):
+    """Catches all unhandled exceptions and writes them to crash_log.txt"""
+    log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "crash_log.txt")
+    with open(log_path, "a") as f:
+        f.write(f"--- CRASH LOG: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ---\n")
+        traceback.print_exception(exc_type, exc_value, exc_traceback, file=f)
+        f.write("\n" + "=" * 50 + "\n\n")
+    # Still print to console if one is open
+    sys.__excepthook__(exc_type, exc_value, exc_traceback)
+
+
+sys.excepthook = global_exception_handler
+
 import cv2
 import time
 import numpy as np
@@ -98,7 +117,6 @@ class HotkeyThread(QThread):
             self.toggle_signal.emit()
             time.sleep(0.3)
 
-
 # ---------------------------------------------------------
 # SEPARATE VERIFICATION WINDOW (Glassmorphism)
 # ---------------------------------------------------------
@@ -179,7 +197,6 @@ class VerificationWindow(QWidget):
             )
             self.image_labels[i].setPixmap(scaled_pixmap)
         self.show()
-
 
 # ---------------------------------------------------------
 # MAIN CONTROL PANEL
@@ -547,6 +564,21 @@ class MainWindow(QWidget):
         self.style().unpolish(self.btn_toggle)
         self.style().polish(self.btn_toggle)
 
+    def reset_status(self):
+        self.lbl_status.setText("Ready")
+        self.lbl_status.setObjectName("StatusReady")
+        self.style().unpolish(self.lbl_status)
+        self.style().polish(self.lbl_status)
+
+        self.btn_toggle.setText("Start Recording (F2)")
+        self.btn_toggle.setObjectName("RecordBtnReady")
+        self.btn_toggle.setEnabled(True)
+        self.style().unpolish(self.btn_toggle)
+        self.style().polish(self.btn_toggle)
+
+    def close_app(self):
+        self.record_thread.is_recording = False
+        QApplication.quit()
 
 # ---------------------------------------------------------
 # UAC ELEVATION & MAIN EXECUTION
@@ -557,26 +589,35 @@ def is_admin():
     except:
         return False
 
-
 if __name__ == "__main__":
-    # 1. Auto-Request Administrator Privileges
-    if not is_admin():
-        print("Requesting Administrator privileges...")
-        # Handles both running as a pure python script and as a compiled PyInstaller .exe
-        if getattr(sys, "frozen", False):
-            # Running as compiled executable
-            ctypes.windll.shell32.ShellExecuteW(
-                None, "runas", sys.executable, " ".join(sys.argv[1:]), None, 1
-            )
-        else:
-            # Running as a python script
-            ctypes.windll.shell32.ShellExecuteW(
-                None, "runas", sys.executable, " ".join(sys.argv), None, 1
-            )
-        sys.exit()
+    try:
+        # 1. Auto-Request Administrator Privileges
+        if not is_admin():
+            print("Requesting Administrator privileges...")
+            # Handles both running as a pure python script and as a compiled PyInstaller .exe
+            if getattr(sys, "frozen", False):
+                # Running as compiled executable
+                ctypes.windll.shell32.ShellExecuteW(
+                    None, "runas", sys.executable, " ".join(sys.argv[1:]), None, 1
+                )
+            else:
+                # Running as a python script
+                ctypes.windll.shell32.ShellExecuteW(
+                    None, "runas", sys.executable, " ".join(sys.argv), None, 1
+                )
+            sys.exit()
 
-    # 2. Start Application
-    app = QApplication(sys.argv)
-    window = MainWindow()
-    window.show()
-    sys.exit(app.exec())
+        # 2. Start Application
+        app = QApplication(sys.argv)
+        window = MainWindow()
+        window.show()
+        sys.exit(app.exec())
+        
+    except Exception as e:
+        # Failsafe logging just in case UI fails to initialize
+        log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "crash_log.txt")
+        with open(log_path, "a") as f:
+            f.write(f"--- INIT CRASH LOG: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ---\n")
+            traceback.print_exc(file=f)
+            f.write("\n" + "="*50 + "\n\n")
+        raise
