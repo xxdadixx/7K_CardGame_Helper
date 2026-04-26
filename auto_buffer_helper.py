@@ -3,6 +3,7 @@ import os
 import traceback
 from datetime import datetime
 
+
 # ==============================================================================
 # GLOBAL CRASH LOGGER (Must be at the very top to catch early import errors)
 # ==============================================================================
@@ -117,6 +118,7 @@ class HotkeyThread(QThread):
             self.toggle_signal.emit()
             time.sleep(0.3)
 
+
 # ---------------------------------------------------------
 # SEPARATE VERIFICATION WINDOW (Glassmorphism)
 # ---------------------------------------------------------
@@ -197,6 +199,7 @@ class VerificationWindow(QWidget):
             )
             self.image_labels[i].setPixmap(scaled_pixmap)
         self.show()
+
 
 # ---------------------------------------------------------
 # MAIN CONTROL PANEL
@@ -300,206 +303,400 @@ class MainWindow(QWidget):
             return
 
         success = False
-        best_frame = None
+        best_frame = None if not frames else frames[len(frames) // 2].copy()
         best_boxes = []
         final_24_boxes = []
 
-        print("--- 1. Mathematical Grid Reconstruction ---")
+        print("--- 1. Mathematical Grid Reconstruction (Accumulated Strategy) ---")
+
+        box_clusters = []  # Store unique locations and their detection counts
+
+        # Step 1.1: Collect all possible card boxes across ALL frames
         for i, frame in enumerate(frames):
             gray = cv2.cvtColor(frame, cv2.COLOR_BGRA2GRAY)
             blur = cv2.GaussianBlur(gray, (5, 5), 0)
             edges = cv2.Canny(blur, 30, 150)
 
-            kernel = np.ones((3, 3), np.uint8)
+            # Morphological Closing to fix broken lines from game effects
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+            edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel)
             edges = cv2.dilate(edges, kernel, iterations=1)
 
             contours, _ = cv2.findContours(
                 edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
             )
 
-            valid_boxes = []
             for c in contours:
                 x, y, w, h = cv2.boundingRect(c)
-                aspect_ratio = w / float(h)
+                aspect_ratio = w / float(h) if h != 0 else 0
 
-                if 0.60 <= aspect_ratio <= 0.75 and 150 < w < 400 and 200 < h < 550:
-                    valid_boxes.append((x, y, w, h))
+                # --- MODIFIED: Drastically lowered minimum width/height to support small windowed mode ---
+                if 0.50 <= aspect_ratio <= 0.85 and 40 < w < 500 and 60 < h < 700:
+                    is_overlap = False
 
-            # Non-Maximum Suppression (Filter overlaps)
-            filtered_boxes = []
-            for box in valid_boxes:
-                x1, y1, w1, h1 = box
-                is_overlap = False
-                for f_box in filtered_boxes:
-                    x2, y2, w2, h2 = f_box
-                    if (
-                        abs((x1 + w1 / 2) - (x2 + w2 / 2)) < 30
-                        and abs((y1 + h1 / 2) - (y2 + h2 / 2)) < 30
-                    ):
-                        is_overlap = True
-                        break
-                if not is_overlap:
-                    filtered_boxes.append(box)
+                    # Group boxes that appear in the same physical screen location
+                    for cluster in box_clusters:
+                        x2, y2, w2, h2 = cluster["box"]
 
-            # Keep track of the frame with the most boxes for our debug image
-            if len(filtered_boxes) > len(best_boxes):
-                best_frame = frame.copy()
-                best_boxes = list(filtered_boxes)
+                        # Use dynamic tolerance (40% of box size) instead of fixed 40px to handle jitters better
+                        if abs((x + w / 2) - (x2 + w2 / 2)) < (w * 0.4) and abs(
+                            (y + h / 2) - (y2 + h2 / 2)
+                        ) < (h * 0.4):
+                            # Update moving average for robust coordinate stability
+                            n = cluster["count"]
+                            new_x = int((x + x2 * n) / (n + 1))
+                            new_y = int((y + y2 * n) / (n + 1))
+                            new_w = int((w + w2 * n) / (n + 1))
+                            new_h = int((h + h2 * n) / (n + 1))
 
-            # 1. ANCHOR FRAME FOUND
-            if len(filtered_boxes) >= 14:
-                print(
-                    f"Anchor frame found at index {i} with {len(filtered_boxes)} raw boxes."
-                )
-
-                # 2. Calculate Medians & Centers
-                widths = [b[2] for b in filtered_boxes]
-                heights = [b[3] for b in filtered_boxes]
-                median_w = int(np.median(widths))
-                median_h = int(np.median(heights))
-
-                cx_list = [b[0] + b[2] // 2 for b in filtered_boxes]
-                cy_list = [b[1] + b[3] // 2 for b in filtered_boxes]
-
-                # Helper Function: Cluster and Extrapolate
-                def cluster_and_extrapolate(centers, target_count, max_bound):
-                    centers = sorted(centers)
-                    clusters = []
-                    current_cluster = [centers[0]]
-
-                    # Cluster centers within a 40px tolerance
-                    for c in centers[1:]:
-                        if c - current_cluster[-1] <= 40:
-                            current_cluster.append(c)
-                        else:
-                            clusters.append(int(np.mean(current_cluster)))
-                            current_cluster = [c]
-                    clusters.append(int(np.mean(current_cluster)))
-
-                    # Calculate median gap between valid adjacent clusters
-                    if len(clusters) > 1:
-                        gaps = [
-                            clusters[idx + 1] - clusters[idx]
-                            for idx in range(len(clusters) - 1)
-                        ]
-                        median_gap = int(np.median(gaps))
-                    else:
-                        median_gap = 200  # Safe fallback
-
-                    # Fill missing INTERNAL gaps (e.g. if column 3 was completely missed)
-                    while len(clusters) < target_count:
-                        inserted = False
-                        for idx in range(len(clusters) - 1):
-                            if clusters[idx + 1] - clusters[idx] > 1.5 * median_gap:
-                                clusters.insert(
-                                    idx + 1, int(clusters[idx] + median_gap)
-                                )
-                                inserted = True
-                                break
-                        if not inserted:
+                            cluster["box"] = (new_x, new_y, new_w, new_h)
+                            cluster["count"] += 1
+                            is_overlap = True
                             break
 
-                    # Fill missing EXTERNAL gaps (Leftmost or Rightmost columns)
-                    while len(clusters) < target_count:
-                        space_left = clusters[0]
-                        space_right = max_bound - clusters[-1]
+                    if not is_overlap:
+                        box_clusters.append({"box": (x, y, w, h), "count": 1})
 
-                        # Add to whichever side has more physical screen space
-                        if space_left > space_right:
-                            clusters.insert(0, int(clusters[0] - median_gap))
-                        else:
-                            clusters.append(int(clusters[-1] + median_gap))
+        # Step 1.2: Filter out transient boxes (noise that appeared in less than 3 frames)
+        filtered_boxes = [c["box"] for c in box_clusters if c["count"] >= 3]
+        best_boxes = list(filtered_boxes)
 
-                    return sorted(clusters)[:target_count]
+        # Step 1.3: Generate Master Grid if enough valid anchors are found across the timeline
+        if len(filtered_boxes) >= 6:
+            print(
+                f"Accumulated grid positions found: {len(filtered_boxes)} unique slots over time."
+            )
 
-                # 3 & 4. Extrapolate Columns (X) and Rows (Y)
-                h_frame, w_frame = frame.shape[:2]
-                cols = cluster_and_extrapolate(cx_list, 8, w_frame)
-                rows = cluster_and_extrapolate(cy_list, 3, h_frame)
+            widths = [b[2] for b in filtered_boxes]
+            heights = [b[3] for b in filtered_boxes]
+            median_w = int(np.median(widths))
+            median_h = int(np.median(heights))
 
-                # 5. Generate Master Grid
-                for cy in rows:
-                    for cx in cols:
-                        x = int(cx - median_w / 2)
-                        y = int(cy - median_h / 2)
-                        # Ensure coordinates don't technically go off-screen
-                        x = max(0, x)
-                        y = max(0, y)
-                        final_24_boxes.append((x, y, median_w, median_h))
+            cx_list = [b[0] + b[2] // 2 for b in filtered_boxes]
+            cy_list = [b[1] + b[3] // 2 for b in filtered_boxes]
 
-                print("Mathematical Grid perfectly reconstructed from Anchor Frame.")
-                break  # We generated the 24 mathematical boxes, stop searching!
+            # Helper Function: Template Grid Matching (Voting System / Hough Transform)
+            # Helper Function: Template Grid Matching (Phase & Screen-Center Locking)
+            def cluster_and_fit_grid(centers, target_count, card_size, frame_dim):
+                if not centers:
+                    return []
 
-        # 🌟 NEW: 1.5 MACRO / GLOBAL FRAME FILTERING (Peak Trimming) 🌟
-        clean_frames = []
-        if frames:
-            print("--- 1.5 Global Frame Filtering (Peak Trimming) ---")
-            max_complexity = -1
-            peak_index = 0
-            
-            for f_idx, frame in enumerate(frames):
-                gray = cv2.cvtColor(frame, cv2.COLOR_BGRA2GRAY)
-                canny = cv2.Canny(gray, 30, 150)
-                complexity = canny.sum()
-                
-                if complexity > max_complexity:
-                    max_complexity = complexity
-                    peak_index = f_idx
-                    
-            print(f"Peak text animation detected at frame {peak_index} (Complexity: {max_complexity}).")
-            
-            # Slice the array: Keep only frames AFTER the text fades out (+15 frames)
-            safe_start = peak_index + 15
-            clean_frames = frames[safe_start:]
-            
-            print(f"Filtered out {len(frames) - len(clean_frames)} frames. {len(clean_frames)} clean frames remaining.")
-            
-            # Fallback: If the slice removes everything, default to the very last frame
-            if not clean_frames:
-                print("Warning: Slice resulted in empty buffer. Reverting to the last recorded frame.")
-                clean_frames = [frames[-1]]
+                centers = sorted(centers)
+                clusters = []
+                current_cluster = [centers[0]]
 
-        # 6. Smart Face-Up Extraction (Edge Complexity on CLEAN FRAMES)
-        if final_24_boxes and clean_frames:
-            print("--- 2. Smart Face-Up Extraction (Clean Edge Complexity) ---")
+                for c in centers[1:]:
+                    if c - current_cluster[-1] <= card_size * 0.4:
+                        current_cluster.append(c)
+                    else:
+                        clusters.append(int(np.mean(current_cluster)))
+                        current_cluster = [c]
+                clusters.append(int(np.mean(current_cluster)))
+
+                if len(clusters) > 1:
+                    gaps = [
+                        clusters[idx + 1] - clusters[idx]
+                        for idx in range(len(clusters) - 1)
+                    ]
+                    valid_gaps = [g for g in gaps if g >= card_size * 0.8]
+                    median_gap = (
+                        int(np.median(valid_gaps))
+                        if valid_gaps
+                        else int(card_size * 1.05)
+                    )
+                else:
+                    median_gap = int(card_size * 1.05)
+
+                # 1. Find the true Grid Phase (Robust Median Anchor to ignore noise completely)
+                origin = np.median(clusters)
+                phase_votes = []
+
+                for c in clusters:
+                    steps_from_origin = round((origin - c) / median_gap)
+                    predicted_origin = c + (steps_from_origin * median_gap)
+                    phase_votes.append(predicted_origin)
+
+                true_origin = np.median(
+                    phase_votes
+                )  # This is a perfectly aligned hypothetical card center
+
+                # 2. Slide the grid to find the absolute Screen-Center
+                best_base_offset = true_origin
+                min_center_diff = float("inf")
+
+                for shift in range(-target_count * 2, target_count * 2):
+                    test_base = true_origin + (shift * median_gap)
+
+                    # Calculate where the center of the grid would be
+                    grid_center = test_base + (target_count - 1) * median_gap / 2.0
+
+                    # Calculate distance to the actual middle of the screen
+                    diff = abs(grid_center - (frame_dim / 2.0))
+
+                    if diff < min_center_diff:
+                        min_center_diff = diff
+                        best_base_offset = test_base
+
+                return [
+                    int(best_base_offset + i * median_gap) for i in range(target_count)
+                ]
+
+            h_frame, w_frame = frames[0].shape[:2]
+
+            cols = cluster_and_fit_grid(cx_list, 8, median_w, w_frame)
+            rows = cluster_and_fit_grid(cy_list, 3, median_h, h_frame)
+
+            for cy in rows:
+                for cx in cols:
+                    x = int(cx - median_w / 2)
+                    y = int(cy - median_h / 2)
+                    x = max(-500, x)
+                    y = max(-500, y)
+                    final_24_boxes.append((x, y, median_w, median_h))
+
+            print(
+                "Mathematical Grid perfectly reconstructed via Phase & Screen-Center Locking."
+            )
+
+        else:
+            # --- NEW: Detailed Error Diagnostics ---
+            print("\n--- ERROR DIAGNOSTICS ---")
+            print(
+                f"Total unique objects detected across all frames: {len(box_clusters)}"
+            )
+            print(
+                f"Objects that survived the stability filter (count >= 3): {len(filtered_boxes)}"
+            )
+
+            if not box_clusters:
+                print(
+                    "Cause: No objects matching the card aspect ratio (0.50 - 0.85) were found."
+                )
+                print(
+                    "Suggestion: The game screen might be too dark, or the cards are heavily obscured."
+                )
+            else:
+                print(
+                    "Top 5 most stable objects found (which were ignored or insufficient):"
+                )
+                sorted_clusters = sorted(
+                    box_clusters, key=lambda k: k["count"], reverse=True
+                )[:5]
+                for idx, c in enumerate(sorted_clusters):
+                    x, y, w, h = c["box"]
+                    aspect = w / float(h) if h != 0 else 0
+                    print(
+                        f" {idx+1}. Size: {w}x{h} (Aspect: {aspect:.2f}), Position: ({x},{y}), Seen in {c['count']} frames"
+                    )
+                print(
+                    "Cause: Found potential cards, but not enough remained stable across 3+ frames, or their aspect ratio/size fell outside limits."
+                )
+
+            print(
+                f"\nError: Failed to find enough anchors. Only found {len(filtered_boxes)} stable slots."
+            )
+
+        # --- 2. Smart Face-Up Extraction (Brightness + Variance) ---
+        if len(final_24_boxes) == 24:
+            print("--- 2. Extracting Clear Face-Up Cards ---")
             best_card_images = []
 
             for idx, (x, y, w, h) in enumerate(final_24_boxes):
-                highest_complexity = -1
+                best_frame_score = -1
                 best_roi = None
 
-                # Iterate ONLY through clean_frames!
-                for frame in clean_frames:
-                    roi = frame[y : y + h, x : x + w]
+                # Scan all frames to find the exact moment this specific card is fully revealed
+                for frame in frames:
+                    if (
+                        y < 0
+                        or x < 0
+                        or y + h > frame.shape[0]
+                        or x + w > frame.shape[1]
+                    ):
+                        continue
 
-                    # Safety check in case a box was generated slightly out of bounds
+                    roi = frame[y : y + h, x : x + w]
                     if roi.size == 0:
                         continue
 
-                    gray_roi = cv2.cvtColor(roi, cv2.COLOR_BGRA2GRAY)
-                    blur_roi = cv2.GaussianBlur(gray_roi, (5, 5), 0)
-                    canny_roi = cv2.Canny(blur_roi, 30, 150)
+                    # Crop to center 60% to evaluate only the artwork, ignoring card borders
+                    cy, cx = int(h * 0.2), int(w * 0.2)
+                    if cy > 0 and cx > 0:
+                        center_roi = roi[cy : h - cy, cx : w - cx]
+                    else:
+                        center_roi = roi
 
-                    complexity = canny_roi.sum()
+                    # Convert to Grayscale for evaluation
+                    gray_center = cv2.cvtColor(center_roi, cv2.COLOR_BGRA2GRAY)
 
-                    if complexity > highest_complexity:
-                        highest_complexity = complexity
+                    # 1. Mean Brightness: Fully revealed cards are brighter than mid-flip dark edges
+                    mean_brightness = np.mean(gray_center)
+                    # 2. Laplacian Variance: Measures sharpness and detail
+                    variance = cv2.Laplacian(gray_center, cv2.CV_64F).var()
+
+                    # Combined Score prevents picking mid-flip artifacts
+                    score = (mean_brightness * 2.5) + (variance * 0.1)
+
+                    if score > best_frame_score:
+                        best_frame_score = score
                         best_roi = roi.copy()
 
                 if best_roi is None:
-                    best_roi = (
-                        clean_frames[-1][y : y + h, x : x + w].copy()
-                        if clean_frames
-                        else np.zeros((h, w, 4), dtype=np.uint8)
-                    )
+                    best_roi = np.zeros((h, w, 4), dtype=np.uint8)
 
                 best_card_images.append(best_roi)
-                print(
-                    f"Card {idx+1:02d}/24 extracted with Max Complexity: {highest_complexity:.2f}"
+
+            print("--- 3. Card Matching Algorithm (HSV Color Histograms) ---")
+            processed_rois = []
+            for img in best_card_images:
+                h_img, w_img = img.shape[:2]
+
+                # Crop 25% from all sides to completely remove stars, borders, and UI elements
+                # We only want the character's face/body for comparison
+                crop_y, crop_x = int(h_img * 0.25), int(w_img * 0.25)
+                if crop_y > 0 and crop_x > 0:
+                    cropped = img[crop_y : h_img - crop_y, crop_x : w_img - crop_x]
+                else:
+                    cropped = img
+
+                # Convert to HSV Color Space for robust color comparison
+                hsv = cv2.cvtColor(cropped, cv2.COLOR_BGRA2BGR)
+                hsv = cv2.cvtColor(hsv, cv2.COLOR_BGR2HSV)
+
+                # Calculate 2D Histogram (Hue and Saturation)
+                # Hue bins: 32 (colors), Saturation bins: 32 (intensity)
+                hist = cv2.calcHist([hsv], [0, 1], None, [32, 32], [0, 180, 0, 256])
+                cv2.normalize(hist, hist, alpha=0, beta=1, norm_type=cv2.NORM_MINMAX)
+
+                processed_rois.append(hist)
+
+            pair_ids = [-1] * 24
+            current_pair_id = 1
+
+            pair_colors = [
+                (0, 0, 255),  # Red
+                (0, 255, 0),  # Green
+                (255, 0, 0),  # Blue
+                (0, 255, 255),  # Yellow
+                (255, 0, 255),  # Magenta
+                (255, 255, 0),  # Cyan
+                (0, 165, 255),  # Orange
+                (130, 0, 250),  # Purple
+                (0, 128, 0),  # Dark Green
+                (255, 191, 0),  # Amber
+                (147, 20, 255),  # Deep Pink
+                (255, 255, 255),  # White
+            ]
+
+            # Compare every card's color profile with every other card
+            for i in range(24):
+                if pair_ids[i] != -1:
+                    continue
+
+                best_match_idx = -1
+                best_similarity = -1.0  # For Correlation, 1.0 is a perfect match
+
+                for j in range(i + 1, 24):
+                    if pair_ids[j] != -1:
+                        continue
+
+                    # Compare Histograms using Correlation (HISTCMP_CORREL)
+                    similarity = cv2.compareHist(
+                        processed_rois[i], processed_rois[j], cv2.HISTCMP_CORREL
+                    )
+
+                    if similarity > best_similarity:
+                        best_similarity = similarity
+                        best_match_idx = j
+
+                # Assign ID to the best matching pair
+                pair_ids[i] = current_pair_id
+                if best_match_idx != -1:
+                    pair_ids[best_match_idx] = current_pair_id
+                current_pair_id += 1
+
+            print("--- 4. Rendering Solution Visuals ---")
+            final_display_images = []
+            for i, img in enumerate(best_card_images):
+                display_img = img.copy()
+                pid = pair_ids[i]
+                color = pair_colors[(pid - 1) % 12]
+
+                # Draw thick colored border around the card
+                cv2.rectangle(
+                    display_img,
+                    (0, 0),
+                    (display_img.shape[1], display_img.shape[0]),
+                    color,
+                    8,
                 )
 
-            self.verification_window.display_cards(best_card_images)
+                # Draw Pair Number ID (e.g., P1, P2) in the center
+                text = f"P{pid}"
+                font = cv2.FONT_HERSHEY_SIMPLEX
+                font_scale = 1.0
+                thickness = 2
+                (tw, th), _ = cv2.getTextSize(text, font, font_scale, thickness)
+                tx = (display_img.shape[1] - tw) // 2
+                ty = (display_img.shape[0] + th) // 2
+
+                # Black background for text readability
+                cv2.rectangle(
+                    display_img,
+                    (tx - 5, ty - th - 5),
+                    (tx + tw + 5, ty + 5),
+                    (0, 0, 0),
+                    -1,
+                )
+                # Foreground Text
+                cv2.putText(
+                    display_img, text, (tx, ty), font, font_scale, color, thickness
+                )
+
+                final_display_images.append(display_img)
+
+            # --- NEW: Stitch and Save Full Solution Image for Debugging ---
+            if best_frame is not None:
+                # 1. Create a copy of the frame and dim the background slightly
+                solution_full_img = best_frame.copy()
+                solution_full_img = cv2.addWeighted(
+                    solution_full_img, 0.4, np.zeros_like(solution_full_img), 0.6, 0
+                )
+
+                # 2. Overlay the annotated card images back onto their respective grid positions
+                for idx, (x, y, w, h) in enumerate(final_24_boxes):
+                    if (
+                        y < 0
+                        or x < 0
+                        or y + h > solution_full_img.shape[0]
+                        or x + w > solution_full_img.shape[1]
+                    ):
+                        continue
+
+                    sol_card = final_display_images[idx]
+
+                    # Ensure size matches the exact box dimension before overlaying
+                    if sol_card.shape[:2] != (h, w):
+                        sol_card = cv2.resize(sol_card, (w, h))
+
+                    solution_full_img[y : y + h, x : x + w] = sol_card
+
+                # 3. Save the final composed image to a dedicated directory
+                sol_dir = "solution_logs"
+                os.makedirs(sol_dir, exist_ok=True)
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                sol_filepath = os.path.join(sol_dir, f"solution_vision_{timestamp}.jpg")
+                cv2.imwrite(sol_filepath, solution_full_img)
+                print(f"Solution image exported to: {os.path.abspath(sol_filepath)}")
+            # -------------------------------------------------------------
+
+            # Send matched images to the translucent UI
+            self.verification_window.display_cards(final_display_images)
             success = True
+        else:
+            print(
+                f"Error: Reconstructed grid size is {len(final_24_boxes)}, expected 24. Cannot proceed with extraction."
+            )
 
         # Status Update & Debug Export
         if success:
@@ -540,9 +737,6 @@ class MainWindow(QWidget):
                         1,
                     )
 
-            import os
-            from datetime import datetime
-
             debug_dir = "debug_logs"
             os.makedirs(debug_dir, exist_ok=True)
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -576,6 +770,7 @@ class MainWindow(QWidget):
         self.record_thread.is_recording = False
         QApplication.quit()
 
+
 # ---------------------------------------------------------
 # UAC ELEVATION & MAIN EXECUTION
 # ---------------------------------------------------------
@@ -584,6 +779,7 @@ def is_admin():
         return ctypes.windll.shell32.IsUserAnAdmin()
     except:
         return False
+
 
 if __name__ == "__main__":
     try:
@@ -608,12 +804,16 @@ if __name__ == "__main__":
         window = MainWindow()
         window.show()
         sys.exit(app.exec())
-        
+
     except Exception as e:
         # Failsafe logging just in case UI fails to initialize
-        log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "crash_log.txt")
+        log_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "crash_log.txt"
+        )
         with open(log_path, "a") as f:
-            f.write(f"--- INIT CRASH LOG: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ---\n")
+            f.write(
+                f"--- INIT CRASH LOG: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ---\n"
+            )
             traceback.print_exc(file=f)
-            f.write("\n" + "="*50 + "\n\n")
+            f.write("\n" + "=" * 50 + "\n\n")
         raise
