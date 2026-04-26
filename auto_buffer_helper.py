@@ -430,44 +430,33 @@ class MainWindow(QWidget):
                 print("Mathematical Grid perfectly reconstructed from Anchor Frame.")
                 break  # We generated the 24 mathematical boxes, stop searching!
 
-        # 🌟 NEW: 1.5 MACRO / GLOBAL FRAME FILTERING 🌟
+        # 🌟 NEW: 1.5 MACRO / GLOBAL FRAME FILTERING (Peak Trimming) 🌟
         clean_frames = []
         if frames:
-            print("--- 1.5 Global Frame Filtering (Removing Text Animations) ---")
-            h_full, w_full = frames[0].shape[:2]
-            
-            # Define a massive center region (middle 50% of the screen)
-            cx1, cx2 = int(w_full * 0.25), int(w_full * 0.75)
-            cy1, cy2 = int(h_full * 0.25), int(h_full * 0.75)
-            center_area = (cx2 - cx1) * (cy2 - cy1)
-            
-            # HSV bounds for the golden/yellow "Ready" and "START" texts
-            lower_yellow = np.array([10, 100, 120])
-            upper_yellow = np.array([40, 255, 255])
+            print("--- 1.5 Global Frame Filtering (Peak Trimming) ---")
+            max_complexity = -1
+            peak_index = 0
             
             for f_idx, frame in enumerate(frames):
-                center_roi = frame[cy1:cy2, cx1:cx2]
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGRA2GRAY)
+                canny = cv2.Canny(gray, 30, 150)
+                complexity = canny.sum()
                 
-                # Convert to HSV
-                bgr_roi = cv2.cvtColor(center_roi, cv2.COLOR_BGRA2BGR)
-                hsv_roi = cv2.cvtColor(bgr_roi, cv2.COLOR_BGR2HSV)
-                
-                # Mask and count yellow pixels in the center of the screen
-                yellow_mask = cv2.inRange(hsv_roi, lower_yellow, upper_yellow)
-                yellow_ratio = cv2.countNonZero(yellow_mask) / center_area
-                
-                # If the center of the screen has a heavy concentration of yellow (>3%), 
-                # it's the giant text animation. Discard the WHOLE frame.
-                if yellow_ratio < 0.03:
-                    clean_frames.append(frame)
-                else:
-                    print(f"Discarding Frame {f_idx}: Yellow Ratio in center is {yellow_ratio:.2%}")
+                if complexity > max_complexity:
+                    max_complexity = complexity
+                    peak_index = f_idx
+                    
+            print(f"Peak text animation detected at frame {peak_index} (Complexity: {max_complexity}).")
             
-            print(f"Filtered out {len(frames) - len(clean_frames)} corrupted frames. {len(clean_frames)} clean frames remaining.")
+            # Slice the array: Keep only frames AFTER the text fades out (+15 frames)
+            safe_start = peak_index + 15
+            clean_frames = frames[safe_start:]
             
-            # Fallback: Just in case a super short recording filters everything
+            print(f"Filtered out {len(frames) - len(clean_frames)} frames. {len(clean_frames)} clean frames remaining.")
+            
+            # Fallback: If the slice removes everything, default to the very last frame
             if not clean_frames:
-                print("Warning: All frames were filtered. Reverting to the last recorded frame.")
+                print("Warning: Slice resulted in empty buffer. Reverting to the last recorded frame.")
                 clean_frames = [frames[-1]]
 
         # 6. Smart Face-Up Extraction (Edge Complexity on CLEAN FRAMES)
@@ -479,7 +468,7 @@ class MainWindow(QWidget):
                 highest_complexity = -1
                 best_roi = None
 
-                # 🌟 IMPORTANT: We now ONLY iterate through clean_frames!
+                # Iterate ONLY through clean_frames!
                 for frame in clean_frames:
                     roi = frame[y : y + h, x : x + w]
 
@@ -487,7 +476,6 @@ class MainWindow(QWidget):
                     if roi.size == 0:
                         continue
 
-                    # Calculate total edge complexity using Canny
                     gray_roi = cv2.cvtColor(roi, cv2.COLOR_BGRA2GRAY)
                     blur_roi = cv2.GaussianBlur(gray_roi, (5, 5), 0)
                     canny_roi = cv2.Canny(blur_roi, 30, 150)
