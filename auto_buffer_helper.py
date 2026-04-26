@@ -1,25 +1,6 @@
 import sys
 import os
 import traceback
-from datetime import datetime
-
-
-# ==============================================================================
-# GLOBAL CRASH LOGGER (Must be at the very top to catch early import errors)
-# ==============================================================================
-def global_exception_handler(exc_type, exc_value, exc_traceback):
-    """Catches all unhandled exceptions and writes them to crash_log.txt"""
-    log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "crash_log.txt")
-    with open(log_path, "a") as f:
-        f.write(f"--- CRASH LOG: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ---\n")
-        traceback.print_exception(exc_type, exc_value, exc_traceback, file=f)
-        f.write("\n" + "=" * 50 + "\n\n")
-    # Still print to console if one is open
-    sys.__excepthook__(exc_type, exc_value, exc_traceback)
-
-
-sys.excepthook = global_exception_handler
-
 import cv2
 import time
 import numpy as np
@@ -38,6 +19,23 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QImage, QPixmap, QPainter, QColor
+
+
+# ==============================================================================
+# GLOBAL CRASH LOGGER (Must be at the very top to catch early import errors)
+# ==============================================================================
+def global_exception_handler(exc_type, exc_value, exc_traceback):
+    """Catches all unhandled exceptions and writes them to crash_log.txt"""
+    log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "crash_log.txt")
+    with open(log_path, "a") as f:
+        f.write(f"--- CRASH LOG: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ---\n")
+        traceback.print_exception(exc_type, exc_value, exc_traceback, file=f)
+        f.write("\n" + "=" * 50 + "\n\n")
+    # Still print to console if one is open
+    sys.__excepthook__(exc_type, exc_value, exc_traceback)
+
+
+sys.excepthook = global_exception_handler
 
 # ---------------------------------------------------------
 # APPLE QSS STYLING
@@ -302,6 +300,41 @@ class MainWindow(QWidget):
             self.reset_status()
             return
 
+        print("--- 0. Filtering Game UI Text Overlays ---")
+        clean_frames = []
+        global_bright_scores = []
+
+        # Analyze the center of the screen where giant text usually appears
+        for f in frames:
+            h, w = f.shape[:2]
+            center_roi = f[int(h * 0.3) : int(h * 0.7), int(w * 0.2) : int(w * 0.8)]
+            gray = cv2.cvtColor(center_roi, cv2.COLOR_BGRA2GRAY)
+
+            # Count intensely bright pixels (Yellow/White text)
+            _, binary = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY)
+            global_bright_scores.append(cv2.countNonZero(binary))
+
+        # Find the baseline brightness and filter out massive spikes
+        median_bright = np.median(global_bright_scores)
+        spike_threshold = max(median_bright * 2.5, 2000)
+
+        for f, score in zip(frames, global_bright_scores):
+            # Keep only frames without the massive bright text overlay
+            if score < spike_threshold:
+                clean_frames.append(f)
+
+        if len(clean_frames) >= 5:
+            print(
+                f"Removed {len(frames) - len(clean_frames)} polluted frames. Proceeding with {len(clean_frames)} clean frames."
+            )
+            frames = clean_frames
+        else:
+            print(
+                "Warning: Filter was too aggressive. Using the last 40% of frames as fallback."
+            )
+            keep = max(5, int(len(frames) * 0.4))
+            frames = frames[-keep:]
+
         success = False
         best_frame = None if not frames else frames[len(frames) // 2].copy()
         best_boxes = []
@@ -496,16 +529,18 @@ class MainWindow(QWidget):
                 f"\nError: Failed to find enough anchors. Only found {len(filtered_boxes)} stable slots."
             )
 
-        # --- 2. Smart Face-Up Extraction (Brightness + Variance) ---
+        # --- 2. Smart Face-Up Extraction (Time-Smoothed Variance) ---
         if len(final_24_boxes) == 24:
             print("--- 2. Extracting Clear Face-Up Cards ---")
             best_card_images = []
 
             for idx, (x, y, w, h) in enumerate(final_24_boxes):
-                best_frame_score = -1
                 best_roi = None
 
-                # Scan all frames to find the exact moment this specific card is fully revealed
+                # We will calculate a score for every frame
+                frame_scores = []
+                rois = []
+
                 for frame in frames:
                     if (
                         y < 0
@@ -513,116 +548,126 @@ class MainWindow(QWidget):
                         or y + h > frame.shape[0]
                         or x + w > frame.shape[1]
                     ):
+                        frame_scores.append(0)
+                        rois.append(np.zeros((h, w, 4), dtype=np.uint8))
                         continue
 
                     roi = frame[y : y + h, x : x + w]
-                    if roi.size == 0:
-                        continue
+                    rois.append(roi)
 
-                    # Crop to center 60% to evaluate only the artwork, ignoring card borders
+                    # Crop 20% to avoid borders
                     cy, cx = int(h * 0.2), int(w * 0.2)
-                    if cy > 0 and cx > 0:
-                        center_roi = roi[cy : h - cy, cx : w - cx]
+                    center_roi = (
+                        roi[cy : h - cy, cx : w - cx] if cy > 0 and cx > 0 else roi
+                    )
+
+                    gray = cv2.cvtColor(center_roi, cv2.COLOR_BGRA2GRAY)
+                    brightness = np.mean(gray)
+
+                    # Penalize frames that are blindly bright (UI Text) or completely dark (Card Backs)
+                    if brightness < 30 or brightness > 185:
+                        frame_scores.append(0)
                     else:
-                        center_roi = roi
+                        var = cv2.Laplacian(gray, cv2.CV_64F).var()
+                        frame_scores.append(var)
 
-                    # Convert to Grayscale for evaluation
-                    gray_center = cv2.cvtColor(center_roi, cv2.COLOR_BGRA2GRAY)
+                # Apply Moving Average (Window = 5) to remove 1-frame spikes (mid-flips & flashes)
+                smoothed_scores = []
+                for i in range(len(frame_scores)):
+                    start = max(0, i - 2)
+                    end = min(len(frame_scores), i + 3)
+                    avg_score = sum(frame_scores[start:end]) / (end - start)
+                    smoothed_scores.append(avg_score)
 
-                    # 1. Mean Brightness: Fully revealed cards are brighter than mid-flip dark edges
-                    mean_brightness = np.mean(gray_center)
-                    # 2. Laplacian Variance: Measures sharpness and detail
-                    variance = cv2.Laplacian(gray_center, cv2.CV_64F).var()
-
-                    # Combined Score prevents picking mid-flip artifacts
-                    score = (mean_brightness * 2.5) + (variance * 0.1)
-
-                    if score > best_frame_score:
-                        best_frame_score = score
-                        best_roi = roi.copy()
-
-                if best_roi is None:
-                    best_roi = np.zeros((h, w, 4), dtype=np.uint8)
-
+                best_frame_idx = int(np.argmax(smoothed_scores))
+                best_roi = rois[best_frame_idx].copy()
                 best_card_images.append(best_roi)
 
-            print("--- 3. Card Matching Algorithm (HSV Color Histograms) ---")
-            processed_rois = []
+            print("--- 3. Global Greedy Card Matching ---")
+            processed_hists = []
+            processed_grays = []
+
             for img in best_card_images:
                 h_img, w_img = img.shape[:2]
 
-                # Crop 25% from all sides to completely remove stars, borders, and UI elements
-                # We only want the character's face/body for comparison
+                # Deep crop (25%) to focus purely on the character's face/core
                 crop_y, crop_x = int(h_img * 0.25), int(w_img * 0.25)
-                if crop_y > 0 and crop_x > 0:
-                    cropped = img[crop_y : h_img - crop_y, crop_x : w_img - crop_x]
-                else:
-                    cropped = img
+                cropped = (
+                    img[crop_y : h_img - crop_y, crop_x : w_img - crop_x]
+                    if crop_y > 0 and crop_x > 0
+                    else img
+                )
 
-                # Convert to HSV Color Space for robust color comparison
+                # 1. Color Histogram
                 hsv = cv2.cvtColor(cropped, cv2.COLOR_BGRA2BGR)
                 hsv = cv2.cvtColor(hsv, cv2.COLOR_BGR2HSV)
-
-                # Calculate 2D Histogram (Hue and Saturation)
-                # Hue bins: 32 (colors), Saturation bins: 32 (intensity)
                 hist = cv2.calcHist([hsv], [0, 1], None, [32, 32], [0, 180, 0, 256])
                 cv2.normalize(hist, hist, alpha=0, beta=1, norm_type=cv2.NORM_MINMAX)
+                processed_hists.append(hist)
 
-                processed_rois.append(hist)
+                # 2. Structural Image (16x16 blurred grayscale for robust MSE)
+                gray = cv2.cvtColor(cropped, cv2.COLOR_BGRA2GRAY)
+                small_gray = cv2.resize(gray, (16, 16))
+                processed_grays.append(small_gray.astype(np.float32))
 
-            pair_ids = [-1] * 24
-            current_pair_id = 1
-
-            pair_colors = [
-                (0, 0, 255),  # Red
-                (0, 255, 0),  # Green
-                (255, 0, 0),  # Blue
-                (0, 255, 255),  # Yellow
-                (255, 0, 255),  # Magenta
-                (255, 255, 0),  # Cyan
-                (0, 165, 255),  # Orange
-                (130, 0, 250),  # Purple
-                (0, 128, 0),  # Dark Green
-                (255, 191, 0),  # Amber
-                (147, 20, 255),  # Deep Pink
-                (255, 255, 255),  # White
-            ]
-
-            # Compare every card's color profile with every other card
+            # Calculate Global Distance Matrix
+            distances = []
             for i in range(24):
-                if pair_ids[i] != -1:
-                    continue
-
-                best_match_idx = -1
-                best_similarity = -1.0  # For Correlation, 1.0 is a perfect match
-
                 for j in range(i + 1, 24):
-                    if pair_ids[j] != -1:
-                        continue
+                    # Histogram Correlation (1.0 = perfect match)
+                    corr = cv2.compareHist(
+                        processed_hists[i], processed_hists[j], cv2.HISTCMP_CORREL
+                    )
+                    hist_dist = 1.0 - corr
 
-                    # Compare Histograms using Correlation (HISTCMP_CORREL)
-                    similarity = cv2.compareHist(
-                        processed_rois[i], processed_rois[j], cv2.HISTCMP_CORREL
+                    # Mean Squared Error for structural check
+                    mse = np.mean((processed_grays[i] - processed_grays[j]) ** 2) / (
+                        255.0**2
                     )
 
-                    if similarity > best_similarity:
-                        best_similarity = similarity
-                        best_match_idx = j
+                    # Combined Distance (Weighting: 70% Color, 30% Structure)
+                    total_dist = (hist_dist * 0.7) + (mse * 0.3)
+                    distances.append((total_dist, i, j))
 
-                # Assign ID to the best matching pair
-                pair_ids[i] = current_pair_id
-                if best_match_idx != -1:
-                    pair_ids[best_match_idx] = current_pair_id
-                current_pair_id += 1
+            # Sort by lowest distance first (Best matches at the top)
+            distances.sort(key=lambda x: x[0])
+
+            # Global Greedy Pairing ensures exactly 12 unique pairs
+            pair_ids = [-1] * 24
+            current_pair_id = 1
+            paired_count = 0
+
+            for dist, i, j in distances:
+                if pair_ids[i] == -1 and pair_ids[j] == -1:
+                    pair_ids[i] = current_pair_id
+                    pair_ids[j] = current_pair_id
+                    current_pair_id += 1
+                    paired_count += 2
+                if paired_count == 24:
+                    break
 
             print("--- 4. Rendering Solution Visuals ---")
             final_display_images = []
+            pair_colors = [
+                (0, 0, 255),
+                (0, 255, 0),
+                (255, 0, 0),
+                (0, 255, 255),
+                (255, 0, 255),
+                (255, 255, 0),
+                (0, 165, 255),
+                (130, 0, 250),
+                (0, 128, 0),
+                (255, 191, 0),
+                (147, 20, 255),
+                (255, 255, 255),
+            ]
+
             for i, img in enumerate(best_card_images):
                 display_img = img.copy()
                 pid = pair_ids[i]
                 color = pair_colors[(pid - 1) % 12]
 
-                # Draw thick colored border around the card
                 cv2.rectangle(
                     display_img,
                     (0, 0),
@@ -631,7 +676,6 @@ class MainWindow(QWidget):
                     8,
                 )
 
-                # Draw Pair Number ID (e.g., P1, P2) in the center
                 text = f"P{pid}"
                 font = cv2.FONT_HERSHEY_SIMPLEX
                 font_scale = 1.0
@@ -640,7 +684,6 @@ class MainWindow(QWidget):
                 tx = (display_img.shape[1] - tw) // 2
                 ty = (display_img.shape[0] + th) // 2
 
-                # Black background for text readability
                 cv2.rectangle(
                     display_img,
                     (tx - 5, ty - th - 5),
@@ -648,22 +691,19 @@ class MainWindow(QWidget):
                     (0, 0, 0),
                     -1,
                 )
-                # Foreground Text
                 cv2.putText(
                     display_img, text, (tx, ty), font, font_scale, color, thickness
                 )
 
                 final_display_images.append(display_img)
 
-            # --- NEW: Stitch and Save Full Solution Image for Debugging ---
+            # Stitch and Save Full Solution Image
             if best_frame is not None:
-                # 1. Create a copy of the frame and dim the background slightly
                 solution_full_img = best_frame.copy()
                 solution_full_img = cv2.addWeighted(
                     solution_full_img, 0.4, np.zeros_like(solution_full_img), 0.6, 0
                 )
 
-                # 2. Overlay the annotated card images back onto their respective grid positions
                 for idx, (x, y, w, h) in enumerate(final_24_boxes):
                     if (
                         y < 0
@@ -674,23 +714,19 @@ class MainWindow(QWidget):
                         continue
 
                     sol_card = final_display_images[idx]
-
-                    # Ensure size matches the exact box dimension before overlaying
                     if sol_card.shape[:2] != (h, w):
                         sol_card = cv2.resize(sol_card, (w, h))
 
                     solution_full_img[y : y + h, x : x + w] = sol_card
 
-                # 3. Save the final composed image to a dedicated directory
                 sol_dir = "solution_logs"
-                os.makedirs(sol_dir, exist_ok=True)
+                if not os.path.exists(sol_dir):
+                    os.makedirs(sol_dir)
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                 sol_filepath = os.path.join(sol_dir, f"solution_vision_{timestamp}.jpg")
                 cv2.imwrite(sol_filepath, solution_full_img)
                 print(f"Solution image exported to: {os.path.abspath(sol_filepath)}")
-            # -------------------------------------------------------------
 
-            # Send matched images to the translucent UI
             self.verification_window.display_cards(final_display_images)
             success = True
         else:
