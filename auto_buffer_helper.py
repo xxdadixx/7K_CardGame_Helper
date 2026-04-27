@@ -551,20 +551,78 @@ class MainWindow(QWidget):
                 f"\nError: Failed to find enough anchors. Only found {len(filtered_boxes)} stable slots."
             )
 
-        # --- 2. Smart Face-Up Extraction (Vibrancy & Library Caching) ---
-        if len(final_24_boxes) == 24:
-            print("--- 2. Extracting Face-Up Cards (Color Vibrancy Method) ---")
-            best_card_images = []
+        # --- PREPARE MACHINE LEARNING ENVIRONMENT ---
+        try:
+            from sklearn.ensemble import RandomForestClassifier
+        except ImportError:
+            print("\n[CRITICAL ERROR] Machine Learning library not found!")
+            print("Please open terminal and run: pip install scikit-learn\n")
+            self.reset_status()
+            return
 
-            # Ensure Library Directories Exist
+        if len(final_24_boxes) == 24:
+            print("--- 2. Machine Learning: Supervised Extraction ---")
+
             good_dir = os.path.join("card_library", "good_cards")
             bad_dir = os.path.join("card_library", "bad_cards")
             os.makedirs(good_dir, exist_ok=True)
             os.makedirs(bad_dir, exist_ok=True)
 
+            # Feature Extractor for the ML Model
+            def extract_ml_features(img):
+                h_i, w_i = img.shape[:2]
+                # Deep crop to focus on core features
+                cy, cx = int(h_i * 0.20), int(w_i * 0.20)
+                c_img = img[cy : h_i - cy, cx : w_i - cx] if cy > 0 and cx > 0 else img
+                bgr = (
+                    cv2.cvtColor(c_img, cv2.COLOR_BGRA2BGR)
+                    if c_img.shape[2] == 4
+                    else c_img
+                )
+
+                # 1. Color Profile (HSV Histogram)
+                hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+                hist = cv2.calcHist([hsv], [0, 1], None, [16, 16], [0, 180, 0, 256])
+                cv2.normalize(hist, hist)
+
+                # 2. Structural Profile (Downscaled Grayscale)
+                gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+                small_gray = cv2.resize(gray, (16, 16)).flatten() / 255.0
+
+                return np.concatenate((hist.flatten(), small_gray))
+
+            # --- ML PHASE 1: Train the AI on the fly ---
+            X_train, y_train = [], []
+            for folder, label in [(good_dir, 1), (bad_dir, 0)]:
+                for filename in os.listdir(folder):
+                    if filename.endswith((".jpg", ".png")):
+                        filepath = os.path.join(folder, filename)
+                        img = cv2.imread(filepath)
+                        if img is not None:
+                            X_train.append(extract_ml_features(img))
+                            y_train.append(label)
+
+            ai_model = None
+            if (
+                len(set(y_train)) == 2
+            ):  # Ensure we have both Good (1) and Bad (0) examples
+                print(f"Training AI Model with {len(X_train)} saved examples...")
+                ai_model = RandomForestClassifier(n_estimators=100, random_state=42)
+                ai_model.fit(X_train, y_train)
+            else:
+                print(
+                    "⚠️ AI Needs Training Data! Please sort some correct/wrong cards into the 'card_library' folders."
+                )
+                print("Using basic fallback logic for this run...")
+
+            # --- ML PHASE 2: Predict and Extract Best Frames ---
+            best_card_images = []
+            slot_features = []
+
             for idx, (x, y, w, h) in enumerate(final_24_boxes):
-                best_score = -1
+                best_prob = -1
                 best_roi = None
+                best_feat = None
 
                 for frame in frames:
                     if (
@@ -574,173 +632,115 @@ class MainWindow(QWidget):
                         or x + w > frame.shape[1]
                     ):
                         continue
-
                     roi = frame[y : y + h, x : x + w]
                     if roi.size == 0:
                         continue
 
-                    # Crop borders away
-                    cy, cx = int(h * 0.25), int(w * 0.25)
-                    inner_roi = (
-                        roi[cy : h - cy, cx : w - cx] if cy > 0 and cx > 0 else roi
-                    )
+                    feat = extract_ml_features(roi)
 
-                    bgr = cv2.cvtColor(inner_roi, cv2.COLOR_BGRA2BGR)
-                    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
-                    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-
-                    mean_v = np.mean(hsv[:, :, 2])
-                    mean_s = np.mean(hsv[:, :, 1])
-
-                    # 1. Reject dark backs and bright UI text
-                    if mean_v < 40 or mean_v > 220 or mean_s < 20:
-                        score = 0
+                    if ai_model:
+                        # ML Prediction (0.0 to 1.0)
+                        prob_good = ai_model.predict_proba([feat])[0][1]
+                        score = prob_good
                     else:
-                        # 2. Reward vibrant, highly detailed frames (Anime characters)
-                        var = cv2.Laplacian(gray, cv2.CV_64F).var()
-                        score = var * mean_s
+                        # Fallback just to gather initial data
+                        bgr = cv2.cvtColor(roi, cv2.COLOR_BGRA2BGR)
+                        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+                        score = cv2.Laplacian(gray, cv2.CV_64F).var()
 
-                    if score > best_score:
-                        best_score = score
+                    if score > best_prob:
+                        best_prob = score
                         best_roi = roi.copy()
+                        best_feat = feat
 
-                if best_roi is None or best_score < 500:
+                # Acceptance Gate
+                threshold = 0.60 if ai_model else 50
+                if best_roi is None or best_prob < threshold:
                     best_roi = np.zeros((h, w, 4), dtype=np.uint8)
+                    slot_features.append(None)
+                    print(
+                        f"[Slot {idx+1:02d}] ❌ AI REJECTED (Confidence: {best_prob*100:.1f}%)"
+                    )
+                else:
+                    slot_features.append(best_feat)
+                    if ai_model:
+                        print(
+                            f"[Slot {idx+1:02d}] ✅ AI ACCEPTED (Confidence: {best_prob*100:.1f}%)"
+                        )
 
                 best_card_images.append(best_roi)
 
-            print("--- 3. Smart Library Matching & Caching ---")
-
-            def extract_features(img):
-                h_img, w_img = img.shape[:2]
-                cy, cx = int(h_img * 0.25), int(w_img * 0.25)
-                c_img = (
-                    img[cy : h_img - cy, cx : w_img - cx] if cy > 0 and cx > 0 else img
-                )
-                bgr = (
-                    cv2.cvtColor(c_img, cv2.COLOR_BGRA2BGR)
-                    if c_img.shape[2] == 4
-                    else c_img
-                )
-
-                hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
-                hist = cv2.calcHist([hsv], [0, 1], None, [16, 16], [0, 180, 0, 256])
-                cv2.normalize(hist, hist, alpha=0, beta=1, norm_type=cv2.NORM_MINMAX)
-
-                gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-                s_gray = cv2.resize(gray, (16, 16)).astype(np.float32)
-                return hist, s_gray
-
-            def calc_sim(f1, f2):
-                corr = cv2.compareHist(f1[0], f2[0], cv2.HISTCMP_CORREL)
-                mse = np.mean((f1[1] - f2[1]) ** 2) / (255.0**2)
-                return (max(0, corr) * 0.7) + ((1.0 - mse) * 0.3)
-
-            # A. Load Good Library
-            library_features = []
-            library_names = []
-            for filename in os.listdir(good_dir):
-                if filename.endswith((".jpg", ".png")):
-                    tmpl = cv2.imread(os.path.join(good_dir, filename))
-                    if tmpl is not None:
-                        library_features.append(extract_features(tmpl))
-                        library_names.append(filename)
-
-            print(
-                f"Loaded {len(library_features)} reference templates from 'good_cards' folder."
-            )
-
-            # B. Extract current slot features
-            slot_features = []
-            for img in best_card_images:
-                if np.sum(img) == 0:
-                    slot_features.append(None)
-                else:
-                    slot_features.append(extract_features(img))
-
-            pair_ids = ["BLANK"] * 24
-            current_pid = 1
-            lib_to_pid = {}
-
-            print("\n--- DETAILED MATCHING LOG ---")
-
-            # C. Match against Library First
-            for i, feat in enumerate(slot_features):
-                if feat is None:
-                    continue
-
-                pair_ids[i] = "FAIL"  # Default to fail until proven good
-                best_sim = -1
-                best_lib_idx = -1
-
-                for j, lib_feat in enumerate(library_features):
-                    sim = calc_sim(feat, lib_feat)
-                    if sim > best_sim:
-                        best_sim = sim
-                        best_lib_idx = j
-
-                if best_sim > 0.82:  # High confidence library match
-                    lib_name = library_names[best_lib_idx]
-                    if lib_name not in lib_to_pid:
-                        lib_to_pid[lib_name] = f"P{current_pid}"
-                        current_pid += 1
-                    pair_ids[i] = lib_to_pid[lib_name]
-                    print(
-                        f"[Slot {i+1:02d}] MATCHED LIBRARY -> {lib_name} (Confidence: {best_sim:.2f})"
-                    )
-
-            # D. Cross-Match Unknowns & Save to Libraries
+            # --- ML PHASE 3: Strict Pairing & Auto-Sorting ---
+            print("\n--- 3. Strict Match & Auto-Sorting ---")
+            distances = []
             for i in range(24):
-                if pair_ids[i] != "FAIL" or slot_features[i] is None:
+                if slot_features[i] is None:
                     continue
-
-                best_sim = -1
-                best_match_idx = -1
-
                 for j in range(i + 1, 24):
-                    if pair_ids[j] != "FAIL" or slot_features[j] is None:
+                    if slot_features[j] is None:
                         continue
 
-                    sim = calc_sim(slot_features[i], slot_features[j])
-                    if sim > best_sim:
-                        best_sim = sim
-                        best_match_idx = j
+                    hist_i, gray_i = slot_features[i][:256], slot_features[i][256:]
+                    hist_j, gray_j = slot_features[j][:256], slot_features[j][256:]
 
-                if best_sim > 0.82:  # New pair discovered
-                    new_pid = f"P{current_pid}"
-                    current_pid += 1
-                    pair_ids[i] = new_pid
-                    pair_ids[best_match_idx] = new_pid
-                    print(
-                        f"[Slot {i+1:02d} & {best_match_idx+1:02d}] NEW PAIR DISCOVERED -> {new_pid} (Confidence: {best_sim:.2f})"
+                    hist_corr = cv2.compareHist(
+                        hist_i.astype(np.float32),
+                        hist_j.astype(np.float32),
+                        cv2.HISTCMP_CORREL,
                     )
+                    hist_dist = 1.0 - max(0, hist_corr)
+                    mse = np.mean((gray_i - gray_j) ** 2)
 
-                    # Save to Good Library for future
-                    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    total_dist = (hist_dist * 0.7) + (mse * 0.3)
+                    distances.append((total_dist, i, j))
+
+            distances.sort(key=lambda x: x[0])
+
+            pair_ids = ["FAIL"] * 24
+            current_pid = 1
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+            for dist, i, j in distances:
+                if pair_ids[i] == "FAIL" and pair_ids[j] == "FAIL":
+                    # If similarity distance is low enough, consider it a solid pair
+                    if dist < 0.4:
+                        pid_str = f"P{current_pid}"
+                        pair_ids[i] = pid_str
+                        pair_ids[j] = pid_str
+                        current_pid += 1
+
+                        # Save to Good Library
+                        cv2.imwrite(
+                            os.path.join(good_dir, f"good_{ts}_{i}.jpg"),
+                            best_card_images[i],
+                        )
+                        cv2.imwrite(
+                            os.path.join(good_dir, f"good_{ts}_{j}.jpg"),
+                            best_card_images[j],
+                        )
+                    if current_pid > 12:
+                        break
+
+            # Save unmatched/failed cards to Bad Library
+            failed_count = 0
+            for i in range(24):
+                if pair_ids[i] == "FAIL" and np.sum(best_card_images[i]) > 0:
                     cv2.imwrite(
-                        os.path.join(good_dir, f"hero_{ts}_{i}.jpg"),
-                        best_card_images[i],
+                        os.path.join(bad_dir, f"bad_{ts}_{i}.jpg"), best_card_images[i]
                     )
-                else:
-                    print(
-                        f"[Slot {i+1:02d}] ERROR: UNMATCHED CARD (Max Confidence: {best_sim:.2f})"
-                    )
-                    # Save to Bad Library
-                    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    cv2.imwrite(
-                        os.path.join(bad_dir, f"fail_{ts}_{i}.jpg"), best_card_images[i]
-                    )
+                    failed_count += 1
 
-            print("-----------------------------\n")
+            print(
+                f"Matched {current_pid - 1} pairs successfully. Sent {failed_count} unmatched cards to 'bad_cards'."
+            )
 
+            # --- 4. Rendering Solution Visuals ---
             print("--- 4. Rendering Solution Visuals ---")
             final_display_images = []
 
             def get_color(pid_str):
                 if pid_str == "FAIL":
                     return (0, 0, 255)  # Red for fail
-                if pid_str == "BLANK":
-                    return (100, 100, 100)  # Gray for blank
                 colors = [
                     (0, 255, 0),
                     (255, 0, 0),
@@ -773,7 +773,7 @@ class MainWindow(QWidget):
                     8,
                 )
 
-                if pid not in ["FAIL", "BLANK"]:
+                if pid != "FAIL":
                     font = cv2.FONT_HERSHEY_SIMPLEX
                     (tw, th), _ = cv2.getTextSize(pid, font, 1.0, 2)
                     tx = (display_img.shape[1] - tw) // 2
