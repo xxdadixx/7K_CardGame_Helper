@@ -551,47 +551,50 @@ class MainWindow(QWidget):
                 f"\nError: Failed to find enough anchors. Only found {len(filtered_boxes)} stable slots."
             )
 
-        # --- PREPARE MACHINE LEARNING ENVIRONMENT ---
-        try:
-            from sklearn.ensemble import RandomForestClassifier
-        except ImportError:
-            print("\n[CRITICAL ERROR] Machine Learning library not found!")
-            print("Please open terminal and run: pip install scikit-learn\n")
-            self.reset_status()
-            return
-
+        # --- 2. Advanced Machine Learning (HOG + Random Forest AI) ---
         if len(final_24_boxes) == 24:
-            print("--- 2. Machine Learning: Supervised Extraction ---")
+            print("--- 2. Extracting Frames (HOG Structural AI) ---")
 
             good_dir = os.path.join("card_library", "good_cards")
             bad_dir = os.path.join("card_library", "bad_cards")
             os.makedirs(good_dir, exist_ok=True)
             os.makedirs(bad_dir, exist_ok=True)
 
-            # Feature Extractor for the ML Model
-            def extract_ml_features(img):
+            # HOG Descriptor: Maps the physical shape and texture (edges, character features)
+            hog = cv2.HOGDescriptor((32, 32), (16, 16), (8, 8), (8, 8), 9)
+
+            def extract_advanced_features(img):
+                """Extracts structural shapes (HOG) and color distributions (HSV)"""
                 h_i, w_i = img.shape[:2]
-                # Deep crop to focus on core features
                 cy, cx = int(h_i * 0.20), int(w_i * 0.20)
                 c_img = img[cy : h_i - cy, cx : w_i - cx] if cy > 0 and cx > 0 else img
-                bgr = (
-                    cv2.cvtColor(c_img, cv2.COLOR_BGRA2BGR)
-                    if c_img.shape[2] == 4
-                    else c_img
+
+                # Resize to a strict 32x32 format for uniform HOG calculation
+                resized = cv2.resize(c_img, (32, 32))
+
+                # 1. Structural Features (HOG - 324 dimensions)
+                gray = (
+                    cv2.cvtColor(resized, cv2.COLOR_BGRA2GRAY)
+                    if resized.shape[2] == 4
+                    else cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
                 )
+                hog_feats = hog.compute(gray).flatten()
 
-                # 1. Color Profile (HSV Histogram)
+                # 2. Color Features (HSV - 64 dimensions)
+                bgr = (
+                    cv2.cvtColor(resized, cv2.COLOR_BGRA2BGR)
+                    if resized.shape[2] == 4
+                    else resized
+                )
                 hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
-                hist = cv2.calcHist([hsv], [0, 1], None, [16, 16], [0, 180, 0, 256])
+                hist = cv2.calcHist([hsv], [0, 1], None, [8, 8], [0, 180, 0, 256])
                 cv2.normalize(hist, hist)
+                color_feats = hist.flatten()
 
-                # 2. Structural Profile (Downscaled Grayscale)
-                gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-                small_gray = cv2.resize(gray, (16, 16)).flatten() / 255.0
+                # Total 388 highly descriptive features representing exactly what a human sees
+                return np.concatenate((hog_feats, color_feats)).astype(np.float32)
 
-                return np.concatenate((hist.flatten(), small_gray))
-
-            # --- ML PHASE 1: Train the AI on the fly ---
+            # --- ML PHASE 1: Train OpenCV Random Forest (RTrees) ---
             X_train, y_train = [], []
             for folder, label in [(good_dir, 1), (bad_dir, 0)]:
                 for filename in os.listdir(folder):
@@ -599,30 +602,33 @@ class MainWindow(QWidget):
                         filepath = os.path.join(folder, filename)
                         img = cv2.imread(filepath)
                         if img is not None:
-                            X_train.append(extract_ml_features(img))
+                            X_train.append(extract_advanced_features(img))
                             y_train.append(label)
 
             ai_model = None
-            if (
-                len(set(y_train)) == 2
-            ):  # Ensure we have both Good (1) and Bad (0) examples
-                print(f"Training AI Model with {len(X_train)} saved examples...")
-                ai_model = RandomForestClassifier(n_estimators=100, random_state=42)
-                ai_model.fit(X_train, y_train)
+            if len(set(y_train)) == 2:
+                print(f"Training RTrees AI Model with {len(X_train)} saved examples...")
+                train_data = np.array(X_train, dtype=np.float32)
+                responses = np.array(y_train, dtype=np.int32)
+
+                # RTrees (Random Forest) excels at non-linear structural decision making
+                ai_model = cv2.ml.RTrees_create()
+                ai_model.setMaxDepth(15)
+                ai_model.setMinSampleCount(2)
+                ai_model.setTermCriteria((cv2.TERM_CRITERIA_MAX_ITER, 100, 0.01))
+                ai_model.train(train_data, cv2.ml.ROW_SAMPLE, responses)
             else:
                 print(
-                    "⚠️ AI Needs Training Data! Please sort some correct/wrong cards into the 'card_library' folders."
+                    "⚠️ AI Training skipped (Needs both Good and Bad cards in 'card_library'). Gathering data..."
                 )
-                print("Using basic fallback logic for this run...")
 
             # --- ML PHASE 2: Predict and Extract Best Frames ---
             best_card_images = []
-            slot_features = []
+            extracted_features_for_match = []
 
             for idx, (x, y, w, h) in enumerate(final_24_boxes):
-                best_prob = -1
+                best_sharpness = -1
                 best_roi = None
-                best_feat = None
 
                 for frame in frames:
                     if (
@@ -636,60 +642,73 @@ class MainWindow(QWidget):
                     if roi.size == 0:
                         continue
 
-                    feat = extract_ml_features(roi)
+                    # 1. AI Gatekeeper (Is this frame structurally a Good Card?)
+                    is_good = True
+                    if ai_model is not None:
+                        feat = extract_advanced_features(roi)
+                        feat_arr = np.array([feat], dtype=np.float32)
+                        _, result = ai_model.predict(feat_arr)
+                        is_good = int(result[0][0]) == 1
 
-                    if ai_model:
-                        # ML Prediction (0.0 to 1.0)
-                        prob_good = ai_model.predict_proba([feat])[0][1]
-                        score = prob_good
-                    else:
-                        # Fallback just to gather initial data
-                        bgr = cv2.cvtColor(roi, cv2.COLOR_BGRA2BGR)
-                        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-                        score = cv2.Laplacian(gray, cv2.CV_64F).var()
-
-                    if score > best_prob:
-                        best_prob = score
-                        best_roi = roi.copy()
-                        best_feat = feat
-
-                # Acceptance Gate
-                threshold = 0.60 if ai_model else 50
-                if best_roi is None or best_prob < threshold:
-                    best_roi = np.zeros((h, w, 4), dtype=np.uint8)
-                    slot_features.append(None)
-                    print(
-                        f"[Slot {idx+1:02d}] ❌ AI REJECTED (Confidence: {best_prob*100:.1f}%)"
-                    )
-                else:
-                    slot_features.append(best_feat)
-                    if ai_model:
-                        print(
-                            f"[Slot {idx+1:02d}] ✅ AI ACCEPTED (Confidence: {best_prob*100:.1f}%)"
+                    # 2. Find the sharpest frame among the AI-approved "Good" frames
+                    if is_good:
+                        bgr = (
+                            cv2.cvtColor(roi, cv2.COLOR_BGRA2BGR)
+                            if roi.shape[2] == 4
+                            else roi
                         )
+                        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+                        sharpness = cv2.Laplacian(gray, cv2.CV_64F).var()
+
+                        if sharpness > best_sharpness:
+                            best_sharpness = sharpness
+                            best_roi = roi.copy()
+
+                if best_roi is None:
+                    # AI completely rejected this slot (e.g., card never flipped, or blocked by UI text)
+                    best_roi = np.zeros((h, w, 4), dtype=np.uint8)
+                    extracted_features_for_match.append(None)
+                    print(f"[Slot {idx+1:02d}] ❌ AI REJECTED (Identified as Bad Card)")
+                else:
+                    extracted_features_for_match.append(best_roi)
+                    print(
+                        f"[Slot {idx+1:02d}] ✅ AI ACCEPTED (Sharpness: {best_sharpness:.1f})"
+                    )
 
                 best_card_images.append(best_roi)
 
             # --- ML PHASE 3: Strict Pairing & Auto-Sorting ---
             print("\n--- 3. Strict Match & Auto-Sorting ---")
+
+            def get_matching_signature(img):
+                """Detailed color/structure signature purely for matching identical cards."""
+                c = img[
+                    int(img.shape[0] * 0.25) : int(img.shape[0] * 0.75),
+                    int(img.shape[1] * 0.25) : int(img.shape[1] * 0.75),
+                ]
+                bgr = cv2.cvtColor(c, cv2.COLOR_BGRA2BGR) if c.shape[2] == 4 else c
+                hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+                hist = cv2.calcHist([hsv], [0, 1], None, [16, 16], [0, 180, 0, 256])
+                cv2.normalize(hist, hist)
+
+                gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+                small_gray = cv2.resize(gray, (16, 16)).astype(np.float32) / 255.0
+                return hist.flatten(), small_gray
+
             distances = []
             for i in range(24):
-                if slot_features[i] is None:
+                if extracted_features_for_match[i] is None:
                     continue
                 for j in range(i + 1, 24):
-                    if slot_features[j] is None:
+                    if extracted_features_for_match[j] is None:
                         continue
 
-                    hist_i, gray_i = slot_features[i][:256], slot_features[i][256:]
-                    hist_j, gray_j = slot_features[j][:256], slot_features[j][256:]
+                    sig_i = get_matching_signature(extracted_features_for_match[i])
+                    sig_j = get_matching_signature(extracted_features_for_match[j])
 
-                    hist_corr = cv2.compareHist(
-                        hist_i.astype(np.float32),
-                        hist_j.astype(np.float32),
-                        cv2.HISTCMP_CORREL,
-                    )
-                    hist_dist = 1.0 - max(0, hist_corr)
-                    mse = np.mean((gray_i - gray_j) ** 2)
+                    corr = cv2.compareHist(sig_i[0], sig_j[0], cv2.HISTCMP_CORREL)
+                    hist_dist = 1.0 - max(0, corr)
+                    mse = np.mean((sig_i[1] - sig_j[1]) ** 2)
 
                     total_dist = (hist_dist * 0.7) + (mse * 0.3)
                     distances.append((total_dist, i, j))
@@ -700,16 +719,16 @@ class MainWindow(QWidget):
             current_pid = 1
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
 
+            # Match strictly based on minimum distance
             for dist, i, j in distances:
                 if pair_ids[i] == "FAIL" and pair_ids[j] == "FAIL":
-                    # If similarity distance is low enough, consider it a solid pair
-                    if dist < 0.4:
+                    if dist < 0.35:  # Strict threshold for identical character matching
                         pid_str = f"P{current_pid}"
                         pair_ids[i] = pid_str
                         pair_ids[j] = pid_str
                         current_pid += 1
 
-                        # Save to Good Library
+                        # AI LEARNING: Save verified good cards to library
                         cv2.imwrite(
                             os.path.join(good_dir, f"good_{ts}_{i}.jpg"),
                             best_card_images[i],
@@ -721,7 +740,7 @@ class MainWindow(QWidget):
                     if current_pid > 12:
                         break
 
-            # Save unmatched/failed cards to Bad Library
+            # Segregate failed/unmatched cards to bad library for future AI correction
             failed_count = 0
             for i in range(24):
                 if pair_ids[i] == "FAIL" and np.sum(best_card_images[i]) > 0:
@@ -731,7 +750,7 @@ class MainWindow(QWidget):
                     failed_count += 1
 
             print(
-                f"Matched {current_pid - 1} pairs successfully. Sent {failed_count} unmatched cards to 'bad_cards'."
+                f"Matched {current_pid - 1} pairs. Sent {failed_count} rejected cards to 'bad_cards'."
             )
 
             # --- 4. Rendering Solution Visuals ---
@@ -805,11 +824,9 @@ class MainWindow(QWidget):
                         or x + w > solution_full_img.shape[1]
                     ):
                         continue
-
                     sol_card = final_display_images[idx]
                     if sol_card.shape[:2] != (h, w):
                         sol_card = cv2.resize(sol_card, (w, h))
-
                     solution_full_img[y : y + h, x : x + w] = sol_card
 
                 sol_dir = "solution_logs"

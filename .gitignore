@@ -31,6 +31,7 @@ dist/
 # debug_logs/
 # *.jpg
 # *.png
+/debug_logs
 
 # ---------------------------------------------------------
 # IDEs and OS Specific
