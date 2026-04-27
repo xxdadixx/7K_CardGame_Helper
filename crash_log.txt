@@ -7,3 +7,12 @@ UnboundLocalError: cannot access local variable 'os' where it is not associated 
 
 ==================================================
 
+--- CRASH LOG: 2026-04-27 11:28:52 ---
+Traceback (most recent call last):
+  File "E:\Work\7K_CardGame_Helper\auto_buffer_helper.py", line 584, in process_buffer
+    hsv_inner = cv2.cvtColor(inner_roi, cv2.COLOR_BGRA2HSV)
+                                        ^^^^^^^^^^^^^^^^^^
+AttributeError: module 'cv2' has no attribute 'COLOR_BGRA2HSV'
+
+==================================================
+

@@ -363,15 +363,17 @@ class MainWindow(QWidget):
                 x, y, w, h = cv2.boundingRect(c)
                 aspect_ratio = w / float(h) if h != 0 else 0
 
-                # --- MODIFIED: Drastically lowered minimum width/height to support small windowed mode ---
-                if 0.50 <= aspect_ratio <= 0.85 and 40 < w < 500 and 60 < h < 700:
+                # --- MODIFIED: Extreme relaxed constraints for ultra-squished windows ---
+                # Aspect Ratio broadened to 0.15 - 1.20 (Supports extreme pillar-like thin cards)
+                # Minimum size lowered to 15x30 to support the smallest window modes
+                if 0.15 <= aspect_ratio <= 1.20 and 15 < w < 600 and 30 < h < 1000:
                     is_overlap = False
 
                     # Group boxes that appear in the same physical screen location
                     for cluster in box_clusters:
                         x2, y2, w2, h2 = cluster["box"]
 
-                        # Use dynamic tolerance (40% of box size) instead of fixed 40px to handle jitters better
+                        # Use dynamic tolerance (40% of box size) instead of fixed px to handle jitters
                         if abs((x + w / 2) - (x2 + w2 / 2)) < (w * 0.4) and abs(
                             (y + h / 2) - (y2 + h2 / 2)
                         ) < (h * 0.4):
@@ -408,72 +410,91 @@ class MainWindow(QWidget):
             cx_list = [b[0] + b[2] // 2 for b in filtered_boxes]
             cy_list = [b[1] + b[3] // 2 for b in filtered_boxes]
 
-            # Helper Function: Template Grid Matching (Voting System / Hough Transform)
-            # Helper Function: Template Grid Matching (Phase & Screen-Center Locking)
+            # Helper Function: Hit-Based Voting & Pairwise Gap Analysis
             def cluster_and_fit_grid(centers, target_count, card_size, frame_dim):
                 if not centers:
                     return []
 
+                # 1. Group extremely close centers to remove micro-jitters
                 centers = sorted(centers)
                 clusters = []
                 current_cluster = [centers[0]]
 
                 for c in centers[1:]:
-                    if c - current_cluster[-1] <= card_size * 0.4:
+                    if c - current_cluster[-1] <= card_size * 0.3:
                         current_cluster.append(c)
                     else:
                         clusters.append(int(np.mean(current_cluster)))
                         current_cluster = [c]
                 clusters.append(int(np.mean(current_cluster)))
 
-                if len(clusters) > 1:
-                    gaps = [
-                        clusters[idx + 1] - clusters[idx]
-                        for idx in range(len(clusters) - 1)
-                    ]
-                    valid_gaps = [g for g in gaps if g >= card_size * 0.8]
-                    median_gap = (
-                        int(np.median(valid_gaps))
-                        if valid_gaps
-                        else int(card_size * 1.05)
-                    )
-                else:
-                    median_gap = int(card_size * 1.05)
+                # 🌟 2. THE ULTIMATE GAP FINDER (Pairwise Distance Analysis) 🌟
+                # Measure distance between EVERY pair of clusters, not just adjacent ones.
+                # This bypasses noise completely (e.g. noise inserted between Row 1 and Row 2).
+                all_gaps = []
+                for i in range(len(clusters)):
+                    for j in range(i + 1, len(clusters)):
+                        dist = clusters[j] - clusters[i]
+                        all_gaps.append(dist)
 
-                # 1. Find the true Grid Phase (Robust Median Anchor to ignore noise completely)
-                origin = np.median(clusters)
-                phase_votes = []
+                # A valid 1x gap is roughly between 0.8x and 1.8x the card size.
+                single_gaps = [
+                    g for g in all_gaps if card_size * 0.8 <= g <= card_size * 1.8
+                ]
+
+                if single_gaps:
+                    median_gap = int(np.median(single_gaps))
+                else:
+                    median_gap = int(card_size * 1.15)  # Safe fallback
+
+                # 3. Slide the template grid to find the Max Hits
+                best_base_offset = clusters[0]
+                max_hits = -1
+                min_error = float("inf")
+                best_center_dist = float("inf")
 
                 for c in clusters:
-                    steps_from_origin = round((origin - c) / median_gap)
-                    predicted_origin = c + (steps_from_origin * median_gap)
-                    phase_votes.append(predicted_origin)
+                    for offset_idx in range(target_count):
+                        test_base = c - (offset_idx * median_gap)
 
-                true_origin = np.median(
-                    phase_votes
-                )  # This is a perfectly aligned hypothetical card center
+                        hits = 0
+                        error = 0
+                        for expected_idx in range(target_count):
+                            expected_pos = test_base + (expected_idx * median_gap)
+                            dists = [abs(expected_pos - cl) for cl in clusters]
+                            min_dist = min(dists) if dists else float("inf")
 
-                # 2. Slide the grid to find the absolute Screen-Center
-                best_base_offset = true_origin
-                min_center_diff = float("inf")
+                            # If a detected card aligns with a grid line, it's a hit!
+                            if min_dist < card_size * 0.3:
+                                hits += 1
+                            error += min_dist
 
-                for shift in range(-target_count * 2, target_count * 2):
-                    test_base = true_origin + (shift * median_gap)
+                        # Calculate distance to screen center to break ties
+                        grid_center = test_base + (target_count - 1) * median_gap / 2.0
+                        center_dist = abs(grid_center - (frame_dim / 2.0))
 
-                    # Calculate where the center of the grid would be
-                    grid_center = test_base + (target_count - 1) * median_gap / 2.0
-
-                    # Calculate distance to the actual middle of the screen
-                    diff = abs(grid_center - (frame_dim / 2.0))
-
-                    if diff < min_center_diff:
-                        min_center_diff = diff
-                        best_base_offset = test_base
+                        # Rules: 1. Maximize Hits  2. Minimize Error  3. Tie-breaker: Closest to Screen Center
+                        if hits > max_hits:
+                            max_hits = hits
+                            min_error = error
+                            best_center_dist = center_dist
+                            best_base_offset = test_base
+                        elif hits == max_hits:
+                            if error < min_error - 10:
+                                min_error = error
+                                best_center_dist = center_dist
+                                best_base_offset = test_base
+                            elif abs(error - min_error) <= 10:
+                                if center_dist < best_center_dist:
+                                    min_error = error
+                                    best_center_dist = center_dist
+                                    best_base_offset = test_base
 
                 return [
                     int(best_base_offset + i * median_gap) for i in range(target_count)
                 ]
 
+            # --- 🌟 โค้ดที่ต้องนำมาเติม (RESTORE MISSING CODE) 🌟 ---
             h_frame, w_frame = frames[0].shape[:2]
 
             cols = cluster_and_fit_grid(cx_list, 8, median_w, w_frame)
@@ -488,8 +509,9 @@ class MainWindow(QWidget):
                     final_24_boxes.append((x, y, median_w, median_h))
 
             print(
-                "Mathematical Grid perfectly reconstructed via Phase & Screen-Center Locking."
+                "Mathematical Grid perfectly reconstructed via Hit-Based Voting & Pairwise Gap Analysis."
             )
+            # --------------------------------------------------------
 
         else:
             # --- NEW: Detailed Error Diagnostics ---
@@ -529,17 +551,20 @@ class MainWindow(QWidget):
                 f"\nError: Failed to find enough anchors. Only found {len(filtered_boxes)} stable slots."
             )
 
-        # --- 2. Smart Face-Up Extraction (Time-Smoothed Variance) ---
+        # --- 2. Smart Face-Up Extraction (Vibrancy & Library Caching) ---
         if len(final_24_boxes) == 24:
-            print("--- 2. Extracting Clear Face-Up Cards ---")
+            print("--- 2. Extracting Face-Up Cards (Color Vibrancy Method) ---")
             best_card_images = []
 
-            for idx, (x, y, w, h) in enumerate(final_24_boxes):
-                best_roi = None
+            # Ensure Library Directories Exist
+            good_dir = os.path.join("card_library", "good_cards")
+            bad_dir = os.path.join("card_library", "bad_cards")
+            os.makedirs(good_dir, exist_ok=True)
+            os.makedirs(bad_dir, exist_ok=True)
 
-                # We will calculate a score for every frame
-                frame_scores = []
-                rois = []
+            for idx, (x, y, w, h) in enumerate(final_24_boxes):
+                best_score = -1
+                best_roi = None
 
                 for frame in frames:
                     if (
@@ -548,125 +573,197 @@ class MainWindow(QWidget):
                         or y + h > frame.shape[0]
                         or x + w > frame.shape[1]
                     ):
-                        frame_scores.append(0)
-                        rois.append(np.zeros((h, w, 4), dtype=np.uint8))
                         continue
 
                     roi = frame[y : y + h, x : x + w]
-                    rois.append(roi)
+                    if roi.size == 0:
+                        continue
 
-                    # Crop 20% to avoid borders
-                    cy, cx = int(h * 0.2), int(w * 0.2)
-                    center_roi = (
+                    # Crop borders away
+                    cy, cx = int(h * 0.25), int(w * 0.25)
+                    inner_roi = (
                         roi[cy : h - cy, cx : w - cx] if cy > 0 and cx > 0 else roi
                     )
 
-                    gray = cv2.cvtColor(center_roi, cv2.COLOR_BGRA2GRAY)
-                    brightness = np.mean(gray)
+                    bgr = cv2.cvtColor(inner_roi, cv2.COLOR_BGRA2BGR)
+                    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+                    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
 
-                    # Penalize frames that are blindly bright (UI Text) or completely dark (Card Backs)
-                    if brightness < 30 or brightness > 185:
-                        frame_scores.append(0)
+                    mean_v = np.mean(hsv[:, :, 2])
+                    mean_s = np.mean(hsv[:, :, 1])
+
+                    # 1. Reject dark backs and bright UI text
+                    if mean_v < 40 or mean_v > 220 or mean_s < 20:
+                        score = 0
                     else:
+                        # 2. Reward vibrant, highly detailed frames (Anime characters)
                         var = cv2.Laplacian(gray, cv2.CV_64F).var()
-                        frame_scores.append(var)
+                        score = var * mean_s
 
-                # Apply Moving Average (Window = 5) to remove 1-frame spikes (mid-flips & flashes)
-                smoothed_scores = []
-                for i in range(len(frame_scores)):
-                    start = max(0, i - 2)
-                    end = min(len(frame_scores), i + 3)
-                    avg_score = sum(frame_scores[start:end]) / (end - start)
-                    smoothed_scores.append(avg_score)
+                    if score > best_score:
+                        best_score = score
+                        best_roi = roi.copy()
 
-                best_frame_idx = int(np.argmax(smoothed_scores))
-                best_roi = rois[best_frame_idx].copy()
+                if best_roi is None or best_score < 500:
+                    best_roi = np.zeros((h, w, 4), dtype=np.uint8)
+
                 best_card_images.append(best_roi)
 
-            print("--- 3. Global Greedy Card Matching ---")
-            processed_hists = []
-            processed_grays = []
+            print("--- 3. Smart Library Matching & Caching ---")
 
-            for img in best_card_images:
+            def extract_features(img):
                 h_img, w_img = img.shape[:2]
-
-                # Deep crop (25%) to focus purely on the character's face/core
-                crop_y, crop_x = int(h_img * 0.25), int(w_img * 0.25)
-                cropped = (
-                    img[crop_y : h_img - crop_y, crop_x : w_img - crop_x]
-                    if crop_y > 0 and crop_x > 0
-                    else img
+                cy, cx = int(h_img * 0.25), int(w_img * 0.25)
+                c_img = (
+                    img[cy : h_img - cy, cx : w_img - cx] if cy > 0 and cx > 0 else img
+                )
+                bgr = (
+                    cv2.cvtColor(c_img, cv2.COLOR_BGRA2BGR)
+                    if c_img.shape[2] == 4
+                    else c_img
                 )
 
-                # 1. Color Histogram
-                hsv = cv2.cvtColor(cropped, cv2.COLOR_BGRA2BGR)
-                hsv = cv2.cvtColor(hsv, cv2.COLOR_BGR2HSV)
-                hist = cv2.calcHist([hsv], [0, 1], None, [32, 32], [0, 180, 0, 256])
+                hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+                hist = cv2.calcHist([hsv], [0, 1], None, [16, 16], [0, 180, 0, 256])
                 cv2.normalize(hist, hist, alpha=0, beta=1, norm_type=cv2.NORM_MINMAX)
-                processed_hists.append(hist)
 
-                # 2. Structural Image (16x16 blurred grayscale for robust MSE)
-                gray = cv2.cvtColor(cropped, cv2.COLOR_BGRA2GRAY)
-                small_gray = cv2.resize(gray, (16, 16))
-                processed_grays.append(small_gray.astype(np.float32))
+                gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+                s_gray = cv2.resize(gray, (16, 16)).astype(np.float32)
+                return hist, s_gray
 
-            # Calculate Global Distance Matrix
-            distances = []
+            def calc_sim(f1, f2):
+                corr = cv2.compareHist(f1[0], f2[0], cv2.HISTCMP_CORREL)
+                mse = np.mean((f1[1] - f2[1]) ** 2) / (255.0**2)
+                return (max(0, corr) * 0.7) + ((1.0 - mse) * 0.3)
+
+            # A. Load Good Library
+            library_features = []
+            library_names = []
+            for filename in os.listdir(good_dir):
+                if filename.endswith((".jpg", ".png")):
+                    tmpl = cv2.imread(os.path.join(good_dir, filename))
+                    if tmpl is not None:
+                        library_features.append(extract_features(tmpl))
+                        library_names.append(filename)
+
+            print(
+                f"Loaded {len(library_features)} reference templates from 'good_cards' folder."
+            )
+
+            # B. Extract current slot features
+            slot_features = []
+            for img in best_card_images:
+                if np.sum(img) == 0:
+                    slot_features.append(None)
+                else:
+                    slot_features.append(extract_features(img))
+
+            pair_ids = ["BLANK"] * 24
+            current_pid = 1
+            lib_to_pid = {}
+
+            print("\n--- DETAILED MATCHING LOG ---")
+
+            # C. Match against Library First
+            for i, feat in enumerate(slot_features):
+                if feat is None:
+                    continue
+
+                pair_ids[i] = "FAIL"  # Default to fail until proven good
+                best_sim = -1
+                best_lib_idx = -1
+
+                for j, lib_feat in enumerate(library_features):
+                    sim = calc_sim(feat, lib_feat)
+                    if sim > best_sim:
+                        best_sim = sim
+                        best_lib_idx = j
+
+                if best_sim > 0.82:  # High confidence library match
+                    lib_name = library_names[best_lib_idx]
+                    if lib_name not in lib_to_pid:
+                        lib_to_pid[lib_name] = f"P{current_pid}"
+                        current_pid += 1
+                    pair_ids[i] = lib_to_pid[lib_name]
+                    print(
+                        f"[Slot {i+1:02d}] MATCHED LIBRARY -> {lib_name} (Confidence: {best_sim:.2f})"
+                    )
+
+            # D. Cross-Match Unknowns & Save to Libraries
             for i in range(24):
+                if pair_ids[i] != "FAIL" or slot_features[i] is None:
+                    continue
+
+                best_sim = -1
+                best_match_idx = -1
+
                 for j in range(i + 1, 24):
-                    # Histogram Correlation (1.0 = perfect match)
-                    corr = cv2.compareHist(
-                        processed_hists[i], processed_hists[j], cv2.HISTCMP_CORREL
+                    if pair_ids[j] != "FAIL" or slot_features[j] is None:
+                        continue
+
+                    sim = calc_sim(slot_features[i], slot_features[j])
+                    if sim > best_sim:
+                        best_sim = sim
+                        best_match_idx = j
+
+                if best_sim > 0.82:  # New pair discovered
+                    new_pid = f"P{current_pid}"
+                    current_pid += 1
+                    pair_ids[i] = new_pid
+                    pair_ids[best_match_idx] = new_pid
+                    print(
+                        f"[Slot {i+1:02d} & {best_match_idx+1:02d}] NEW PAIR DISCOVERED -> {new_pid} (Confidence: {best_sim:.2f})"
                     )
-                    hist_dist = 1.0 - corr
 
-                    # Mean Squared Error for structural check
-                    mse = np.mean((processed_grays[i] - processed_grays[j]) ** 2) / (
-                        255.0**2
+                    # Save to Good Library for future
+                    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    cv2.imwrite(
+                        os.path.join(good_dir, f"hero_{ts}_{i}.jpg"),
+                        best_card_images[i],
+                    )
+                else:
+                    print(
+                        f"[Slot {i+1:02d}] ERROR: UNMATCHED CARD (Max Confidence: {best_sim:.2f})"
+                    )
+                    # Save to Bad Library
+                    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    cv2.imwrite(
+                        os.path.join(bad_dir, f"fail_{ts}_{i}.jpg"), best_card_images[i]
                     )
 
-                    # Combined Distance (Weighting: 70% Color, 30% Structure)
-                    total_dist = (hist_dist * 0.7) + (mse * 0.3)
-                    distances.append((total_dist, i, j))
-
-            # Sort by lowest distance first (Best matches at the top)
-            distances.sort(key=lambda x: x[0])
-
-            # Global Greedy Pairing ensures exactly 12 unique pairs
-            pair_ids = [-1] * 24
-            current_pair_id = 1
-            paired_count = 0
-
-            for dist, i, j in distances:
-                if pair_ids[i] == -1 and pair_ids[j] == -1:
-                    pair_ids[i] = current_pair_id
-                    pair_ids[j] = current_pair_id
-                    current_pair_id += 1
-                    paired_count += 2
-                if paired_count == 24:
-                    break
+            print("-----------------------------\n")
 
             print("--- 4. Rendering Solution Visuals ---")
             final_display_images = []
-            pair_colors = [
-                (0, 0, 255),
-                (0, 255, 0),
-                (255, 0, 0),
-                (0, 255, 255),
-                (255, 0, 255),
-                (255, 255, 0),
-                (0, 165, 255),
-                (130, 0, 250),
-                (0, 128, 0),
-                (255, 191, 0),
-                (147, 20, 255),
-                (255, 255, 255),
-            ]
+
+            def get_color(pid_str):
+                if pid_str == "FAIL":
+                    return (0, 0, 255)  # Red for fail
+                if pid_str == "BLANK":
+                    return (100, 100, 100)  # Gray for blank
+                colors = [
+                    (0, 255, 0),
+                    (255, 0, 0),
+                    (0, 255, 255),
+                    (255, 0, 255),
+                    (255, 255, 0),
+                    (0, 165, 255),
+                    (130, 0, 250),
+                    (0, 128, 0),
+                    (255, 191, 0),
+                    (147, 20, 255),
+                    (255, 255, 255),
+                    (200, 200, 200),
+                ]
+                idx = (
+                    int(pid_str.replace("P", "")) % len(colors) if "P" in pid_str else 0
+                )
+                return colors[idx]
 
             for i, img in enumerate(best_card_images):
                 display_img = img.copy()
                 pid = pair_ids[i]
-                color = pair_colors[(pid - 1) % 12]
+                color = get_color(pid)
 
                 cv2.rectangle(
                     display_img,
@@ -676,24 +773,20 @@ class MainWindow(QWidget):
                     8,
                 )
 
-                text = f"P{pid}"
-                font = cv2.FONT_HERSHEY_SIMPLEX
-                font_scale = 1.0
-                thickness = 2
-                (tw, th), _ = cv2.getTextSize(text, font, font_scale, thickness)
-                tx = (display_img.shape[1] - tw) // 2
-                ty = (display_img.shape[0] + th) // 2
+                if pid not in ["FAIL", "BLANK"]:
+                    font = cv2.FONT_HERSHEY_SIMPLEX
+                    (tw, th), _ = cv2.getTextSize(pid, font, 1.0, 2)
+                    tx = (display_img.shape[1] - tw) // 2
+                    ty = (display_img.shape[0] + th) // 2
 
-                cv2.rectangle(
-                    display_img,
-                    (tx - 5, ty - th - 5),
-                    (tx + tw + 5, ty + 5),
-                    (0, 0, 0),
-                    -1,
-                )
-                cv2.putText(
-                    display_img, text, (tx, ty), font, font_scale, color, thickness
-                )
+                    cv2.rectangle(
+                        display_img,
+                        (tx - 5, ty - th - 5),
+                        (tx + tw + 5, ty + 5),
+                        (0, 0, 0),
+                        -1,
+                    )
+                    cv2.putText(display_img, pid, (tx, ty), font, 1.0, color, 2)
 
                 final_display_images.append(display_img)
 
@@ -720,8 +813,7 @@ class MainWindow(QWidget):
                     solution_full_img[y : y + h, x : x + w] = sol_card
 
                 sol_dir = "solution_logs"
-                if not os.path.exists(sol_dir):
-                    os.makedirs(sol_dir)
+                os.makedirs(sol_dir, exist_ok=True)
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                 sol_filepath = os.path.join(sol_dir, f"solution_vision_{timestamp}.jpg")
                 cv2.imwrite(sol_filepath, solution_full_img)
@@ -729,10 +821,6 @@ class MainWindow(QWidget):
 
             self.verification_window.display_cards(final_display_images)
             success = True
-        else:
-            print(
-                f"Error: Reconstructed grid size is {len(final_24_boxes)}, expected 24. Cannot proceed with extraction."
-            )
 
         # Status Update & Debug Export
         if success:
